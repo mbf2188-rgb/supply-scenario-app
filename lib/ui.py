@@ -39,7 +39,7 @@ def paginated_table(df: pd.DataFrame, key: str) -> None:
     pages = max(1, (len(df) + size - 1) // size)
     page = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1, key=f"{key}_page")
     start = (page - 1) * size
-    st.dataframe(df.iloc[start : start + size], use_container_width=True, height=460)
+    st.dataframe(df.iloc[start : start + size], width="stretch", height=460)
 
 
 def explorer_table(df: pd.DataFrame) -> pd.DataFrame:
