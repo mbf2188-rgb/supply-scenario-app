@@ -278,13 +278,14 @@ with left:
             fig.update_traces(marker={"size": 16, "opacity": 0.95})
 
             # Remove the modebar so it doesn't cover the legend
+            fig.update_layout(modebar_remove=["zoom", "pan", "select", "lasso2d", "zoomIn", "zoomOut", "autoScale", "resetScale"])
+
             click_data = plotly_events(
                 fig,
                 click_event=True,
                 hover_event=False,
                 select_event=False,
                 override_height=620,
-                config={"displayModeBar": False},
                 key="map_events",
             )
 
