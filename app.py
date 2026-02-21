@@ -10,14 +10,12 @@ st.title("Supply + Freight Scenario Viewer")
 
 uploaded_file = st.file_uploader("Upload scenario file (.csv or .xlsx)", type=["csv", "xlsx"])
 
-
 # -----------------------------
-# Performance notes (implemented)
-# - cache file parse + light normalization
-# - filter via boolean masks (fewer intermediate DataFrames)
-# - compute map center/zoom from df_plot (prevents off-viewport points)
-# - fill missing color values to avoid Plotly dropping all points
-# - avoid passing unsupported plotly_events args (no config=)
+# Fix focus:
+# - Robust lat/lon parsing (strings, commas, whitespace, swapped columns)
+# - Enforce valid lat/lon ranges (prevents Plotly silently rendering nothing)
+# - Prefer px.scatter_map (MapLibre) when available; fallback to px.scatter_mapbox
+# - Keep click-to-details, no lat/lon in hover, auto center/zoom, stable in Streamlit Cloud
 # -----------------------------
 
 @st.cache_data(show_spinner=False)
@@ -66,10 +64,72 @@ def _assigned_terminal_for_site(series: pd.Series) -> str:
     return "Multiple"
 
 
+def _clean_numeric_series(s: pd.Series) -> pd.Series:
+    # Handles: " 32.9 ", "32,9000", "(-96.8)" etc.
+    if s.dtype.kind in "if":
+        return pd.to_numeric(s, errors="coerce")
+    x = s.astype(str).str.strip()
+    x = x.str.replace("\u2212", "-", regex=False)  # unicode minus
+    x = x.str.replace(",", "", regex=False)
+    x = x.str.replace(r"^\((.*)\)$", r"-\1", regex=True)  # (96.8) -> -96.8
+    x = x.str.replace(r"[^0-9\.\-\+eE]", "", regex=True)
+    return pd.to_numeric(x, errors="coerce")
+
+
+def _coerce_and_validate_latlon(df_in: pd.DataFrame, lat_col: str, lon_col: str) -> tuple[pd.DataFrame, dict]:
+    df = df_in.copy()
+    lat = _clean_numeric_series(df[lat_col])
+    lon = _clean_numeric_series(df[lon_col])
+
+    info = {
+        "raw_rows": int(len(df)),
+        "lat_nan": int(lat.isna().sum()),
+        "lon_nan": int(lon.isna().sum()),
+    }
+
+    # Detect swapped columns if most "lat" values look like longitudes and vice-versa
+    lat_in_range = lat.between(-90, 90, inclusive="both")
+    lon_in_range = lon.between(-180, 180, inclusive="both")
+
+    # Swapped heuristic: many lat out of range but would be ok as lon, and many lon out of range but would be ok as lat
+    swapped = (
+        (lat_in_range.mean() < 0.35 and lon_in_range.mean() < 0.35)
+        and (_clean_numeric_series(df[lat_col]).between(-180, 180, inclusive="both").mean() > 0.80)
+        and (_clean_numeric_series(df[lon_col]).between(-90, 90, inclusive="both").mean() > 0.80)
+    )
+
+    # Alternate (more common) swapped case: lat mostly outside [-90,90] but lon mostly outside [-180,180] is rare;
+    # instead check: lat mostly outside [-90,90] while lon mostly inside [-90,90]
+    if not swapped:
+        swapped = (lat_in_range.mean() < 0.35) and (_clean_numeric_series(df[lon_col]).between(-90, 90, inclusive="both").mean() > 0.80)
+
+    info["swapped_detected"] = bool(swapped)
+
+    if swapped:
+        lat, lon = lon, lat
+
+    # Enforce ranges (invalid coords can lead to empty-looking maps)
+    valid = lat.between(-90, 90, inclusive="both") & lon.between(-180, 180, inclusive="both")
+    info["invalid_range"] = int((~valid & ~(lat.isna() | lon.isna())).sum())
+
+    df["_lat_base"] = lat
+    df["_lon_base"] = lon
+    df = df.dropna(subset=["_lat_base", "_lon_base"])
+    df = df.loc[valid.loc[df.index]].copy()
+
+    info["valid_rows"] = int(len(df))
+    if len(df) > 0:
+        info["lat_min"] = float(df["_lat_base"].min())
+        info["lat_max"] = float(df["_lat_base"].max())
+        info["lon_min"] = float(df["_lon_base"].min())
+        info["lon_max"] = float(df["_lon_base"].max())
+    return df, info
+
+
 @st.cache_data(show_spinner=False)
-def _build_sites(df_map_raw: pd.DataFrame, site_col: str, lat_col: str, lon_col: str) -> pd.DataFrame:
-    # One marker per site
-    agg = {lat_col: "first", lon_col: "first"}
+def _build_sites(df_map_raw: pd.DataFrame, site_col: str) -> pd.DataFrame:
+    # One marker per site (uses _lat_base/_lon_base)
+    agg = {"_lat_base": "first", "_lon_base": "first"}
     if "New Terminal" in df_map_raw.columns:
         agg["New Terminal"] = _assigned_terminal_for_site
     if "Brand" in df_map_raw.columns:
@@ -78,13 +138,13 @@ def _build_sites(df_map_raw: pd.DataFrame, site_col: str, lat_col: str, lon_col:
         agg["New TCN"] = "first"
 
     df_sites = df_map_raw.groupby(site_col, as_index=False).agg(agg)
-    df_sites["_lat_plot"] = pd.to_numeric(df_sites[lat_col], errors="coerce")
-    df_sites["_lon_plot"] = pd.to_numeric(df_sites[lon_col], errors="coerce")
+    df_sites["_lat_plot"] = pd.to_numeric(df_sites["_lat_base"], errors="coerce")
+    df_sites["_lon_plot"] = pd.to_numeric(df_sites["_lon_base"], errors="coerce")
     df_sites = df_sites.dropna(subset=["_lat_plot", "_lon_plot"])
     return df_sites
 
 
-def _build_pts(df_map_raw: pd.DataFrame, lat_col: str, lon_col: str) -> pd.DataFrame:
+def _build_pts(df_map_raw: pd.DataFrame) -> pd.DataFrame:
     # Multiple markers (tiny offsets by Product Group)
     df_pts = df_map_raw.copy()
 
@@ -103,8 +163,8 @@ def _build_pts(df_map_raw: pd.DataFrame, lat_col: str, lon_col: str) -> pd.DataF
         off_lat = 0.0
         off_lon = 0.0
 
-    base_lat = pd.to_numeric(df_pts[lat_col], errors="coerce")
-    base_lon = pd.to_numeric(df_pts[lon_col], errors="coerce")
+    base_lat = pd.to_numeric(df_pts["_lat_base"], errors="coerce")
+    base_lon = pd.to_numeric(df_pts["_lon_base"], errors="coerce")
     df_pts["_lat_plot"] = base_lat + off_lat
     df_pts["_lon_plot"] = base_lon + off_lon
     df_pts = df_pts.dropna(subset=["_lat_plot", "_lon_plot"])
@@ -112,10 +172,12 @@ def _build_pts(df_map_raw: pd.DataFrame, lat_col: str, lon_col: str) -> pd.DataF
 
 
 def _prep_color(df_plot: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
-    # Plotly can drop points if the color column contains nulls; fill to keep points visible.
+    # Keep points visible even when category is missing
     df_plot = df_plot.copy()
     if "New Terminal" in df_plot.columns:
         df_plot["New Terminal"] = df_plot["New Terminal"].fillna("Unassigned").astype(str)
+        # Prevent empty strings becoming "invisible categories" in some legend states
+        df_plot.loc[df_plot["New Terminal"].str.strip().eq(""), "New Terminal"] = "Unassigned"
         return df_plot, "New Terminal"
     return df_plot, None
 
@@ -131,6 +193,72 @@ def _map_center_zoom_from_plot(df_plot: pd.DataFrame) -> tuple[float, float, flo
     return center_lat, center_lon, z
 
 
+def _make_map_figure(df_plot: pd.DataFrame, color_arg: str | None, center_lat: float, center_lon: float, z: float, custom, hovertemplate):
+    # Prefer MapLibre (px.scatter_map) if available; fallback to Mapbox.
+    use_maplibre = hasattr(px, "scatter_map")
+    if use_maplibre:
+        fig = px.scatter_map(
+            df_plot,
+            lat="_lat_plot",
+            lon="_lon_plot",
+            color=color_arg,
+            hover_name=None,
+            height=620,
+            zoom=z,
+            center={"lat": center_lat, "lon": center_lon},
+        )
+        # Hide modebar in Streamlit reliably (layout + Streamlit config)
+        fig.update_layout(
+            margin={"l": 0, "r": 0, "t": 0, "b": 0},
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=0.01,
+                xanchor="left",
+                x=0.01,
+                bgcolor="rgba(0,0,0,0)",
+            ),
+        )
+    else:
+        fig = px.scatter_mapbox(
+            df_plot,
+            lat="_lat_plot",
+            lon="_lon_plot",
+            color=color_arg,
+            hover_name=None,
+            height=620,
+            zoom=4,  # overridden below
+        )
+        fig.update_layout(
+            margin={"l": 0, "r": 0, "t": 0, "b": 0},
+            mapbox=dict(
+                style="open-street-map",
+                center={"lat": center_lat, "lon": center_lon},
+                zoom=z,
+            ),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=0.01,
+                xanchor="left",
+                x=0.01,
+                bgcolor="rgba(0,0,0,0)",
+            ),
+            modebar_remove=[
+                "zoom", "pan", "select", "lasso2d",
+                "zoomIn", "zoomOut", "autoScale", "resetScale",
+            ],
+        )
+
+    fig.update_traces(
+        mode="markers",
+        marker={"size": 14, "opacity": 0.95},
+        customdata=custom,
+        hovertemplate=hovertemplate,
+    )
+    return fig
+
+
 if not uploaded_file:
     st.info("Upload a CSV or XLSX to begin.")
     st.stop()
@@ -138,11 +266,9 @@ if not uploaded_file:
 df = _load_df_bytes(uploaded_file.getvalue(), uploaded_file.name)
 st.success(f"Loaded {len(df):,} rows")
 
-# Column aliasing (map stays working if names vary)
 lat_col = _first_existing(df, ["Latitude", "Lat", "LAT"])
 lon_col = _first_existing(df, ["Longitude", "Lon", "Lng", "Long", "LON"])
 
-# Required columns
 required = [
     "Scenario",
     "Site ID",
@@ -183,7 +309,11 @@ sel_assigned_tcn = _safe_multiselect(
     df["New TCN"] if "New TCN" in df.columns else pd.Series([], dtype=object),
     "f_assigned_tcn",
 )
-sel_site_id = _safe_multiselect("Site ID", df["Site ID"] if "Site ID" in df.columns else pd.Series([], dtype=object), "f_site_id")
+sel_site_id = _safe_multiselect(
+    "Site ID",
+    df["Site ID"] if "Site ID" in df.columns else pd.Series([], dtype=object),
+    "f_site_id",
+)
 sel_prod_group = _safe_multiselect(
     "Product Group",
     df["Product Group"] if "Product Group" in df.columns else pd.Series([], dtype=object),
@@ -201,8 +331,13 @@ separate_by_product = st.sidebar.toggle(
     value=False,
     help="Slightly offsets per product group for overlapping lat/lon.",
 )
+show_map_debug = st.sidebar.toggle(
+    "Show map debug counters",
+    value=False,
+    help="Shows why points might be filtered out (NaN/invalid range/swapped detection).",
+)
 
-# --- Filter pipeline (mask-based: less overhead than repeated copies)
+# --- Filter pipeline (mask-based)
 df_f = df
 mask = pd.Series(True, index=df_f.index)
 
@@ -230,7 +365,12 @@ if has_supplier and sel_supplier:
 df_f = df_f.loc[mask].copy()
 
 if search_q:
-    search_cols = [c for c in ["Site ID", "Product Group", "Brand", "Supplier", "Home Terminal", "New Terminal", "Home TCN", "New TCN", "Scenario"] if c in df_f.columns]
+    search_cols = [
+        c for c in [
+            "Site ID", "Product Group", "Brand", "Supplier",
+            "Home Terminal", "New Terminal", "Home TCN", "New TCN", "Scenario"
+        ] if c in df_f.columns
+    ]
     if search_cols:
         blob = df_f[search_cols].astype(str).agg(" | ".join, axis=1)
         df_f = df_f.loc[blob.str.contains(search_q, case=False, na=False)].copy()
@@ -258,131 +398,99 @@ selected_site_id = st.session_state.get("selected_site_id", "")
 
 with left:
     if lat_col and lon_col and (lat_col in df_f.columns) and (lon_col in df_f.columns):
-        df_map_raw = df_f.dropna(subset=[lat_col, lon_col]).copy()
+        # Robust lat/lon coercion + range validation + swap detection
+        df_map_raw, ll_info = _coerce_and_validate_latlon(df_f, lat_col, lon_col)
+
+        if show_map_debug:
+            st.caption(
+                "Map debug — "
+                f"raw={ll_info.get('raw_rows', 0):,}, "
+                f"lat_nan={ll_info.get('lat_nan', 0):,}, "
+                f"lon_nan={ll_info.get('lon_nan', 0):,}, "
+                f"invalid_range={ll_info.get('invalid_range', 0):,}, "
+                f"swapped={ll_info.get('swapped_detected', False)}, "
+                f"valid={ll_info.get('valid_rows', 0):,}"
+            )
+
         if len(df_map_raw) == 0:
-            st.info("No mappable rows after filtering (missing lat/lon).")
+            st.info("No mappable rows after parsing/validation of lat/lon.")
         else:
-            # Coerce numeric base lat/lon
-            df_map_raw[lat_col] = pd.to_numeric(df_map_raw[lat_col], errors="coerce")
-            df_map_raw[lon_col] = pd.to_numeric(df_map_raw[lon_col], errors="coerce")
-            df_map_raw = df_map_raw.dropna(subset=[lat_col, lon_col])
-
-            if len(df_map_raw) == 0:
-                st.info("No mappable rows after filtering (invalid lat/lon).")
+            # Build plotted dataframe
+            if separate_by_product and "Product Group" in df_map_raw.columns:
+                df_plot = _build_pts(df_map_raw)
+                custom = np.column_stack(
+                    [
+                        df_plot["Site ID"].astype(str) if "Site ID" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
+                        df_plot["Product Group"].astype(str) if "Product Group" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
+                        df_plot["Brand"].astype(str) if "Brand" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
+                        df_plot["New Terminal"].astype(str) if "New Terminal" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
+                        df_plot["New TCN"].astype(str) if "New TCN" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
+                    ]
+                )
+                hovertemplate = (
+                    "<b>Site ID:</b> %{customdata[0]}<br>"
+                    "<b>Product:</b> %{customdata[1]}<br>"
+                    "<b>Brand:</b> %{customdata[2]}<br>"
+                    "<b>Assigned Terminal:</b> %{customdata[3]}<br>"
+                    "<b>Assigned TCN:</b> %{customdata[4]}<extra></extra>"
+                )
             else:
-                # Build plotted dataframe
-                if separate_by_product and "Product Group" in df_map_raw.columns:
-                    df_plot = _build_pts(df_map_raw, lat_col, lon_col)
-                    # custom hover fields (no lat/lon)
-                    custom = np.column_stack(
-                        [
-                            df_plot["Site ID"].astype(str) if "Site ID" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
-                            df_plot["Product Group"].astype(str) if "Product Group" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
-                            df_plot["Brand"].astype(str) if "Brand" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
-                            df_plot["New Terminal"].astype(str) if "New Terminal" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
-                            df_plot["New TCN"].astype(str) if "New TCN" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
-                        ]
-                    )
-                    hovertemplate = (
-                        "<b>Site ID:</b> %{customdata[0]}<br>"
-                        "<b>Product:</b> %{customdata[1]}<br>"
-                        "<b>Brand:</b> %{customdata[2]}<br>"
-                        "<b>Assigned Terminal:</b> %{customdata[3]}<br>"
-                        "<b>Assigned TCN:</b> %{customdata[4]}<extra></extra>"
-                    )
-                else:
-                    df_plot = _build_sites(df_map_raw, "Site ID", lat_col, lon_col)
-                    custom = np.column_stack(
-                        [
-                            df_plot["Site ID"].astype(str),
-                            df_plot["Brand"].astype(str) if "Brand" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
-                            df_plot["New Terminal"].astype(str) if "New Terminal" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
-                            df_plot["New TCN"].astype(str) if "New TCN" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
-                        ]
-                    )
-                    hovertemplate = (
-                        "<b>Site ID:</b> %{customdata[0]}<br>"
-                        "<b>Brand:</b> %{customdata[1]}<br>"
-                        "<b>Assigned Terminal:</b> %{customdata[2]}<br>"
-                        "<b>Assigned TCN:</b> %{customdata[3]}<extra></extra>"
-                    )
+                df_plot = _build_sites(df_map_raw, "Site ID")
+                custom = np.column_stack(
+                    [
+                        df_plot["Site ID"].astype(str),
+                        df_plot["Brand"].astype(str) if "Brand" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
+                        df_plot["New Terminal"].astype(str) if "New Terminal" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
+                        df_plot["New TCN"].astype(str) if "New TCN" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
+                    ]
+                )
+                hovertemplate = (
+                    "<b>Site ID:</b> %{customdata[0]}<br>"
+                    "<b>Brand:</b> %{customdata[1]}<br>"
+                    "<b>Assigned Terminal:</b> %{customdata[2]}<br>"
+                    "<b>Assigned TCN:</b> %{customdata[3]}<extra></extra>"
+                )
 
-                # If nothing to plot after coercions, exit early
-                if df_plot.empty:
-                    st.info("No plottable points after numeric coercion.")
-                else:
-                    # IMPORTANT: fill missing terminal values so Plotly does not drop points
-                    df_plot, color_arg = _prep_color(df_plot)
+            if df_plot.empty:
+                st.info("No plottable points after building the plot dataframe.")
+            else:
+                # Ensure color column never null/blank (prevents Plotly category issues)
+                df_plot, color_arg = _prep_color(df_plot)
 
-                    # Compute center/zoom from the plotted dataframe (prevents “points not visible”)
-                    center_lat, center_lon, z = _map_center_zoom_from_plot(df_plot)
+                # Compute center/zoom from plotted df
+                center_lat, center_lon, z = _map_center_zoom_from_plot(df_plot)
 
-                    # Map (stable on Streamlit Cloud)
-                    fig = px.scatter_mapbox(
-                        df_plot,
-                        lat="_lat_plot",
-                        lon="_lon_plot",
-                        color=color_arg,
-                        hover_name=None,
-                        zoom=4,  # overridden below
-                        height=620,
-                    )
-                    fig.update_traces(
-                        mode="markers",
-                        marker={"size": 16, "opacity": 0.95},
-                        customdata=custom,
-                        hovertemplate=hovertemplate,
-                    )
-                    fig.update_layout(
-                        margin={"l": 0, "r": 0, "t": 0, "b": 0},
-                        mapbox=dict(
-                            style="open-street-map",
-                            center={"lat": center_lat, "lon": center_lon},
-                            zoom=z,
-                        ),
-                        legend=dict(
-                            orientation="h",
-                            yanchor="bottom",
-                            y=0.01,
-                            xanchor="left",
-                            x=0.01,
-                            bgcolor="rgba(0,0,0,0)",
-                        ),
-                        modebar_remove=[
-                            "zoom", "pan", "select", "lasso2d",
-                            "zoomIn", "zoomOut", "autoScale", "resetScale",
-                        ],
-                    )
+                fig = _make_map_figure(df_plot, color_arg, center_lat, center_lon, z, custom, hovertemplate)
 
-                    # Lightweight sanity counter
-                    st.caption(f"Plotted points: {len(df_plot):,}")
+                st.caption(f"Plotted points: {len(df_plot):,}")
 
-                    click_data = plotly_events(
-                        fig,
-                        click_event=True,
-                        hover_event=False,
-                        select_event=False,
-                        override_height=620,
-                        key="map_events",
-                    )
+                click_data = plotly_events(
+                    fig,
+                    click_event=True,
+                    hover_event=False,
+                    select_event=False,
+                    override_height=620,
+                    key="map_events",
+                )
 
-                    # Click -> details (use returned customdata if present; else fall back to point index)
-                    if click_data and isinstance(click_data, list) and len(click_data) > 0:
-                        pt = click_data[0]
-                        cd = pt.get("customdata", None)
-                        if isinstance(cd, (list, tuple)) and len(cd) >= 1 and str(cd[0]).strip() != "":
-                            site_id_clicked = str(cd[0])
-                        else:
-                            idx = pt.get("pointIndex", pt.get("pointNumber", None))
-                            site_id_clicked = ""
-                            if idx is not None:
-                                idx = int(idx)
-                                if 0 <= idx < len(df_plot):
-                                    site_id_clicked = str(df_plot.reset_index(drop=True).iloc[idx].get("Site ID", ""))
+                # Click -> details
+                if click_data and isinstance(click_data, list) and len(click_data) > 0:
+                    pt = click_data[0]
+                    cd = pt.get("customdata", None)
 
-                        if site_id_clicked:
-                            st.session_state["selected_site_id"] = site_id_clicked
-                            selected_site_id = site_id_clicked
+                    if isinstance(cd, (list, tuple)) and len(cd) >= 1 and str(cd[0]).strip() != "":
+                        site_id_clicked = str(cd[0])
+                    else:
+                        idx = pt.get("pointIndex", pt.get("pointNumber", None))
+                        site_id_clicked = ""
+                        if idx is not None:
+                            idx = int(idx)
+                            if 0 <= idx < len(df_plot):
+                                site_id_clicked = str(df_plot.reset_index(drop=True).iloc[idx].get("Site ID", ""))
+
+                    if site_id_clicked:
+                        st.session_state["selected_site_id"] = site_id_clicked
+                        selected_site_id = site_id_clicked
     else:
         st.info("Map disabled: Latitude/Longitude columns not found (accepted: Latitude/Lat and Longitude/Lon/Lng/Long).")
 
