@@ -5,3 +5,4 @@ plotly
 openpyxl
 jinja2
 xlsxwriter
+streamlit-plotly-events
