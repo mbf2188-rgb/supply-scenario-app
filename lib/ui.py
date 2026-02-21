@@ -34,24 +34,12 @@ def global_filter(df: pd.DataFrame, text: str) -> pd.DataFrame:
     return df[mask]
 
 
-def safe_dataframe(df: pd.DataFrame, *, height: int | None = None) -> None:
-    """Render dataframe with backward-compatible width behavior across Streamlit versions."""
-    try:
-        st.dataframe(df, use_container_width=True, height=height)
-    except TypeError:
-        # Older Streamlit builds may fail on width-related kwargs.
-        if height is None:
-            st.dataframe(df)
-        else:
-            st.dataframe(df, height=height)
-
-
 def paginated_table(df: pd.DataFrame, key: str) -> None:
     size = st.selectbox("Rows per page", [25, 50, 100, 250], index=1, key=f"{key}_size")
     pages = max(1, (len(df) + size - 1) // size)
     page = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1, key=f"{key}_page")
     start = (page - 1) * size
-    safe_dataframe(df.iloc[start : start + size], height=460)
+    st.dataframe(df.iloc[start : start + size], width="stretch", height=460)
 
 
 def explorer_table(df: pd.DataFrame) -> pd.DataFrame:

@@ -13,7 +13,7 @@ from lib.io import load_uploaded_file
 from lib.maps import build_map_df, build_map_figure, product_groups_available
 from lib.metrics import changed_sites_only, delta_vs_baseline, impacted_sites, terminal_shift_matrix, totals, volume_by_terminal_product
 from lib.normalize import normalize_dataset
-from lib.ui import apply_theme, choose_scenario_defaults, explorer_table, global_filter, paginated_table, safe_dataframe
+from lib.ui import apply_theme, choose_scenario_defaults, explorer_table, global_filter, paginated_table
 
 
 def _git_short_sha() -> str:
@@ -110,18 +110,18 @@ def main() -> None:
         left, right = st.columns(2)
         with left:
             st.subheader("Top wins vs baseline (30-day delta)")
-            safe_dataframe(wins[["Site ID", "Product Group", "delta_30", "delta_1y"]])
+            st.dataframe(wins[["Site ID", "Product Group", "delta_30", "delta_1y"]], width="stretch")
         with right:
             st.subheader("Top losses vs baseline (30-day delta)")
-            safe_dataframe(losses[["Site ID", "Product Group", "delta_30", "delta_1y"]])
+            st.dataframe(losses[["Site ID", "Product Group", "delta_30", "delta_1y"]], width="stretch")
 
         shift = terminal_shift_matrix(selected_df)
         st.subheader("Terminal shift matrix (Home → New)")
-        safe_dataframe(shift)
+        st.dataframe(shift, width="stretch")
 
         ranked = selected_df.groupby("New Terminal", as_index=False)[volume_col].sum().sort_values(volume_col, ascending=False)
         st.subheader(f"Volume ranked by New Terminal ({units})")
-        safe_dataframe(ranked)
+        st.dataframe(ranked, width="stretch")
 
     with compare_tab:
         sx = st.selectbox("Scenario X", scenarios, index=scenarios.index(display) if display in scenarios else 0)
@@ -135,11 +135,11 @@ def main() -> None:
         tx, ty = totals(cmp_df[cmp_df["Scenario"].astype(str) == sx]), totals(cmp_df[cmp_df["Scenario"].astype(str) == sy])
         metric_df = pd.DataFrame([{"Scenario": sx, **tx}, {"Scenario": sy, **ty}])
         st.subheader("Scenario totals (30-day and 1-year)")
-        safe_dataframe(metric_df)
+        st.dataframe(metric_df, width="stretch")
 
         matrix = volume_by_terminal_product(cmp_df, volume_col)
         st.subheader(f"Volume matrix: New Terminal × Product Group ({units})")
-        safe_dataframe(matrix)
+        st.dataframe(matrix, width="stretch")
 
     with explorer_tab:
         pg_options = product_groups_available(selected_df)
