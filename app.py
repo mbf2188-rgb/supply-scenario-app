@@ -115,7 +115,6 @@ has_supplier = "Supplier" in df.columns
 sel_brand = _safe_multiselect("Brand", df["Brand"], "f_brand") if has_brand else []
 sel_supplier = _safe_multiselect("Supplier", df["Supplier"], "f_supplier") if has_supplier else []
 
-# optional: separate markers by product group (slight offsets)
 st.sidebar.subheader("Map Options")
 separate_by_product = st.sidebar.toggle(
     "Separate markers by Product Group (tiny offsets)",
@@ -148,7 +147,7 @@ if search_q:
 
 st.caption(f"Filtered rows: {len(df_f):,}")
 
-# --- Single-scenario page: remove cost KPIs (keep only assignment-impact context)
+# --- KPIs (rows/sites/impacted)
 impacted_sites = None
 if "Home Terminal" in df_f.columns and "New Terminal" in df_f.columns and "Site ID" in df_f.columns:
     impacted_sites = df_f.loc[df_f["Home Terminal"] != df_f["New Terminal"], "Site ID"].nunique()
@@ -194,8 +193,6 @@ with left:
                 # Build map points:
                 # - Default: one marker per site
                 # - Optional: slight offsets per product group
-                df_plot = None
-
                 if separate_by_product and "Product Group" in df_map_raw.columns:
                     offsets = {
                         "Regular": (0.00025, 0.00025),
@@ -209,24 +206,24 @@ with left:
                     def _off_lon(pg):
                         return offsets.get(str(pg), (0.0, 0.0))[1]
 
-                    df_pts = df_map_raw.copy()
-                    df_pts["_lat_plot"] = df_pts[lat_col].astype(float) + df_pts["Product Group"].map(_off_lat).astype(float)
-                    df_pts["_lon_plot"] = df_pts[lon_col].astype(float) + df_pts["Product Group"].map(_off_lon).astype(float)
-                    df_plot = df_pts
+                    df_plot = df_map_raw.copy()
+                    df_plot["_lat_plot"] = df_plot[lat_col].astype(float) + df_plot["Product Group"].map(_off_lat).astype(float)
+                    df_plot["_lon_plot"] = df_plot[lon_col].astype(float) + df_plot["Product Group"].map(_off_lon).astype(float)
 
                     color_col = "New Terminal" if "New Terminal" in df_plot.columns else None
 
-                    # FIX: use scatter_mapbox (stable geo tiles) + mapbox style
+                    # Stable geo rendering on Streamlit Cloud:
                     fig = px.scatter_mapbox(
                         df_plot,
                         lat="_lat_plot",
                         lon="_lon_plot",
                         color=color_col,
                         hover_name=None,
-                        zoom=4,  # overridden below
+                        zoom=4,   # overridden by layout below
                         height=620,
                     )
 
+                    # custom hover without lat/lon
                     custom = np.stack(
                         [
                             df_plot["Site ID"].astype(str) if "Site ID" in df_plot.columns else np.array([""] * len(df_plot), dtype=object),
@@ -237,7 +234,6 @@ with left:
                         ],
                         axis=1,
                     )
-
                     fig.update_traces(
                         customdata=custom,
                         hovertemplate=(
@@ -269,10 +265,9 @@ with left:
                     if "New TCN" in df_map_raw.columns:
                         agg["New TCN"] = "first"
 
-                    df_sites = df_map_raw.groupby("Site ID", as_index=False).agg(agg)
-                    df_sites["_lat_plot"] = df_sites[lat_col].astype(float)
-                    df_sites["_lon_plot"] = df_sites[lon_col].astype(float)
-                    df_plot = df_sites
+                    df_plot = df_map_raw.groupby("Site ID", as_index=False).agg(agg)
+                    df_plot["_lat_plot"] = df_plot[lat_col].astype(float)
+                    df_plot["_lon_plot"] = df_plot[lon_col].astype(float)
 
                     fig = px.scatter_mapbox(
                         df_plot,
@@ -293,7 +288,6 @@ with left:
                         ],
                         axis=1,
                     )
-
                     fig.update_traces(
                         customdata=custom,
                         hovertemplate=(
@@ -304,7 +298,7 @@ with left:
                         ),
                     )
 
-                # Layout: mapbox tiles + auto center/zoom + legend placement
+                # Layout: tiles + auto center/zoom + legend placement
                 fig.update_layout(
                     margin={"l": 0, "r": 0, "t": 0, "b": 0},
                     mapbox=dict(
@@ -320,10 +314,16 @@ with left:
                         x=0.01,
                         bgcolor="rgba(0,0,0,0)",
                     ),
+                    # remove modebar buttons so they don't overlap legend
+                    modebar_remove=[
+                        "zoom", "pan", "select", "lasso2d",
+                        "zoomIn", "zoomOut", "autoScale", "resetScale"
+                    ],
                 )
                 fig.update_traces(marker={"size": 16, "opacity": 0.95})
 
-                # Render + click capture (disable modebar to avoid overlap)
+                # Render + click capture
+                # IMPORTANT: streamlit-plotly-events does NOT accept a "config=" kwarg.
                 click_data = plotly_events(
                     fig,
                     click_event=True,
@@ -331,10 +331,9 @@ with left:
                     select_event=False,
                     override_height=620,
                     key="map_events",
-                    config={"displayModeBar": False, "scrollZoom": True},
                 )
 
-                # Map-click -> details panel (use returned customdata for stability)
+                # Map-click -> details panel (prefer returned customdata for stability)
                 if click_data and isinstance(click_data, list) and len(click_data) > 0:
                     pt = click_data[0]
                     cd = pt.get("customdata", None)
@@ -342,6 +341,16 @@ with left:
                         site_id_clicked = str(cd[0])
                         st.session_state["selected_site_id"] = site_id_clicked
                         selected_site_id = site_id_clicked
+                    else:
+                        # Fallback: pointIndex/pointNumber against df_plot order
+                        idx = pt.get("pointIndex", pt.get("pointNumber", None))
+                        if idx is not None:
+                            idx = int(idx)
+                            if 0 <= idx < len(df_plot):
+                                site_id_clicked = str(df_plot.reset_index(drop=True).iloc[idx].get("Site ID", ""))
+                                if site_id_clicked:
+                                    st.session_state["selected_site_id"] = site_id_clicked
+                                    selected_site_id = site_id_clicked
     else:
         st.info("Map disabled: Latitude/Longitude columns not found (accepted: Latitude/Lat and Longitude/Lon/Lng/Long).")
 
