@@ -1,354 +1,388 @@
-import streamlit as st
-import pandas as pd
+# app.py
+import io
 import numpy as np
+import pandas as pd
 import plotly.express as px
-
+import streamlit as st
 from streamlit_plotly_events import plotly_events
 
-st.set_page_config(layout="wide", page_title="Supply + Freight Scenario Viewer")
-st.title("Supply + Freight Scenario Viewer")
+st.set_page_config(page_title="Scenario Viewer", layout="wide")
 
-uploaded_file = st.file_uploader("Upload scenario file (.csv or .xlsx)", type=["csv", "xlsx"])
+# -----------------------------
+# Utilities
+# -----------------------------
+REQUIRED_BASE_COLS = ["Scenario", "Site ID", "Product Group", "Assigned Terminal", "Assigned TCN", "Lat", "Lon"]
 
-def _load_df(file) -> pd.DataFrame:
-    if file.name.lower().endswith(".csv"):
-        df0 = pd.read_csv(file)
-    else:
-        df0 = pd.read_excel(file, sheet_name=0, engine="openpyxl")
-    df0.columns = [str(c).strip() for c in df0.columns]
-    return df0
+def _norm_col(c: str) -> str:
+    return str(c).strip()
 
-def _first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
+def _coerce_str(s):
+    return s.astype(str).str.strip()
 
-def _safe_multiselect(label: str, series: pd.Series, key: str):
-    opts = sorted([x for x in series.dropna().unique().tolist()])
-    return st.sidebar.multiselect(label, options=opts, default=[], key=key)
+def _safe_contains(series: pd.Series, needle: str) -> pd.Series:
+    if not needle:
+        return pd.Series(True, index=series.index)
+    return series.fillna("").astype(str).str.contains(needle, case=False, regex=False)
 
-def apply_in(df_in: pd.DataFrame, col: str, selected: list):
-    if selected and col in df_in.columns:
-        return df_in[df_in[col].isin(selected)]
-    return df_in
-
-def zoom_from_bounds(lat_min, lat_max, lon_min, lon_max) -> float:
-    """
-    Simple heuristic zoom based on geographic span.
-    """
-    lat_span = max(1e-9, float(lat_max - lat_min))
-    lon_span = max(1e-9, float(lon_max - lon_min))
+def _mapbox_zoom_from_bounds(lat_min, lat_max, lon_min, lon_max) -> float:
+    lat_span = max(1e-6, float(lat_max - lat_min))
+    lon_span = max(1e-6, float(lon_max - lon_min))
     span = max(lat_span, lon_span)
-    # 360 degrees at zoom 0; each +1 zoom halves visible span (roughly).
-    z = np.log2(360.0 / span)
-    return float(np.clip(z, 1.0, 14.5))
+    zoom = np.log2(360.0 / span) - 1.5
+    return float(np.clip(zoom, 1.0, 15.5))
 
-if not uploaded_file:
-    st.info("Upload a CSV or XLSX to begin.")
+def _apply_product_offsets(df_in: pd.DataFrame, lat_col="Lat", lon_col="Lon", group_col="Product Group") -> pd.DataFrame:
+    df = df_in.copy()
+    codes = pd.Categorical(df[group_col]).codes.astype(float)
+    r = 0.0006
+    ang = (codes % 12) * (2.0 * np.pi / 12.0)
+    df["lat_plot"] = df[lat_col].astype(float) + r * np.sin(ang)
+    df["lon_plot"] = df[lon_col].astype(float) + r * np.cos(ang)
+    return df
+
+@st.cache_data(show_spinner=False)
+def read_uploaded(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    name = filename.lower()
+    if name.endswith(".csv"):
+        # Handle common CSV issues (BOM, delimiters)
+        raw = file_bytes
+        try:
+            return pd.read_csv(io.BytesIO(raw), engine="python")
+        except Exception:
+            # fallback with utf-8-sig
+            return pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", engine="python")
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
+    raise ValueError("Unsupported file type (upload .csv or .xlsx)")
+
+def validate_and_prepare(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [_norm_col(c) for c in df.columns]
+
+    missing = [c for c in REQUIRED_BASE_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    # Standardize core columns
+    df["Scenario"] = _coerce_str(df["Scenario"])
+    df["Site ID"] = _coerce_str(df["Site ID"])
+    df["Product Group"] = _coerce_str(df["Product Group"])
+    df["Assigned Terminal"] = _coerce_str(df["Assigned Terminal"])
+    df["Assigned TCN"] = _coerce_str(df["Assigned TCN"])
+
+    # Optional columns
+    for opt in ["Brand", "Supplier", "Home Terminal", "Home TCN", "New Supplier", "Old Supplier"]:
+        if opt in df.columns:
+            df[opt] = df[opt].astype(str).str.strip()
+
+    # Numeric lat/lon
+    df["Lat"] = pd.to_numeric(df["Lat"], errors="coerce")
+    df["Lon"] = pd.to_numeric(df["Lon"], errors="coerce")
+
+    # Helpful derived flags
+    if "Home Terminal" in df.columns:
+        df["Impacted"] = (df["Home Terminal"].astype(str).str.strip() != df["Assigned Terminal"].astype(str).str.strip())
+    else:
+        df["Impacted"] = False
+
+    return df
+
+def build_search_blob(df: pd.DataFrame) -> pd.Series:
+    cols = ["Scenario", "Site ID", "Product Group", "Assigned Terminal", "Assigned TCN"]
+    for c in ["Brand", "Supplier", "Home Terminal"]:
+        if c in df.columns:
+            cols.append(c)
+    blob = df[cols].fillna("").astype(str).agg(" | ".join, axis=1)
+    return blob
+
+def apply_filters(
+    df: pd.DataFrame,
+    scenario: str,
+    terminals: list[str],
+    tcns: list[str],
+    site_ids: list[str],
+    products: list[str],
+    brands: list[str] | None,
+    suppliers: list[str] | None,
+    global_search: str,
+) -> pd.DataFrame:
+    d = df[df["Scenario"] == scenario].copy()
+
+    if terminals:
+        d = d[d["Assigned Terminal"].isin(terminals)]
+    if tcns:
+        d = d[d["Assigned TCN"].isin(tcns)]
+    if site_ids:
+        d = d[d["Site ID"].isin(site_ids)]
+    if products:
+        d = d[d["Product Group"].isin(products)]
+    if brands is not None and "Brand" in d.columns and brands:
+        d = d[d["Brand"].isin(brands)]
+    if suppliers is not None and "Supplier" in d.columns and suppliers:
+        d = d[d["Supplier"].isin(suppliers)]
+
+    if global_search:
+        blob = build_search_blob(d)
+        d = d[_safe_contains(blob, global_search)]
+
+    return d
+
+def kpis(df_scenario: pd.DataFrame, df_filtered: pd.DataFrame) -> dict:
+    rows = int(len(df_filtered))
+    sites = int(df_filtered["Site ID"].nunique()) if not df_filtered.empty else 0
+    impacted_sites = int(df_filtered.loc[df_filtered["Impacted"], "Site ID"].nunique()) if "Impacted" in df_filtered.columns else 0
+
+    # Baseline for scenario-level totals (useful for context)
+    scen_rows = int(len(df_scenario))
+    scen_sites = int(df_scenario["Site ID"].nunique())
+    scen_impacted = int(df_scenario.loc[df_scenario["Impacted"], "Site ID"].nunique()) if "Impacted" in df_scenario.columns else 0
+
+    return {
+        "rows": rows,
+        "sites": sites,
+        "impacted_sites": impacted_sites,
+        "scenario_rows": scen_rows,
+        "scenario_sites": scen_sites,
+        "scenario_impacted_sites": scen_impacted,
+    }
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title("Fuel Supply Optimization Scenario Viewer")
+
+uploaded = st.file_uploader("Upload a .csv or .xlsx with a Scenario column", type=["csv", "xlsx", "xls"])
+
+if not uploaded:
     st.stop()
 
-df = _load_df(uploaded_file)
-st.success(f"Loaded {len(df):,} rows")
+try:
+    raw_df = read_uploaded(uploaded.getvalue(), uploaded.name)
+    df = validate_and_prepare(raw_df)
+except Exception as e:
+    st.error(str(e))
+    st.stop()
 
-# Column aliasing (map stays working if names vary)
-lat_col = _first_existing(df, ["Latitude", "Lat", "LAT"])
-lon_col = _first_existing(df, ["Longitude", "Lon", "Lng", "Long", "LON"])
+# Scenario selection
+scenarios = sorted(df["Scenario"].dropna().unique().tolist())
+scenario = st.selectbox("Scenario", scenarios, index=0)
 
-# Required columns
-required = [
-    "Scenario",
-    "Site ID",
-    "Product Group",
-    "Home Terminal",
-    "New Terminal",
-    "Home TCN",
-    "New TCN",
-    "Total Cost (30 days)",
-]
-missing = [c for c in required if c not in df.columns]
-if missing:
-    st.error(f"Schema warning: Missing required columns: {missing}")
+df_scenario = df[df["Scenario"] == scenario].copy()
 
-with st.expander("Schema details", expanded=False):
-    st.write("Required columns:", required)
-    st.write("Detected columns:", list(df.columns))
-    if lat_col and lon_col:
-        st.write(f"Detected lat/lon columns: {lat_col}, {lon_col}")
-    else:
-        st.write("Detected lat/lon columns: NOT FOUND (accepted: Latitude/Lat and Longitude/Lon/Lng/Long)")
+# Sidebar filters
+with st.sidebar:
+    st.header("Filters")
 
-# --- Sidebar controls
-st.sidebar.header("Global Controls")
+    # Global search
+    global_search = st.text_input("Global search", value="", placeholder="Search across key fields...")
 
-search_q = st.sidebar.text_input("Global search (filters everything)", value="", key="global_search").strip()
+    # Options based on scenario subset for speed
+    opt_terminals = sorted(df_scenario["Assigned Terminal"].dropna().unique().tolist())
+    opt_tcns = sorted(df_scenario["Assigned TCN"].dropna().unique().tolist())
+    opt_sites = sorted(df_scenario["Site ID"].dropna().unique().tolist())
+    opt_products = sorted(df_scenario["Product Group"].dropna().unique().tolist())
 
-scenarios = sorted(df["Scenario"].dropna().unique().tolist()) if "Scenario" in df.columns else []
-scenario = st.sidebar.selectbox("Scenario", scenarios, index=0 if scenarios else None)
+    terminals = st.multiselect("Assigned Terminal", opt_terminals, default=[])
+    tcns = st.multiselect("Assigned TCN", opt_tcns, default=[])
+    site_ids = st.multiselect("Site ID", opt_sites, default=[])
+    products = st.multiselect("Product Group", opt_products, default=[])
 
-st.sidebar.subheader("Filters")
-sel_assigned_terminal = _safe_multiselect(
-    "Assigned Terminal",
-    df["New Terminal"] if "New Terminal" in df.columns else pd.Series([], dtype=object),
-    "f_assigned_terminal",
-)
-sel_assigned_tcn = _safe_multiselect(
-    "Assigned TCN",
-    df["New TCN"] if "New TCN" in df.columns else pd.Series([], dtype=object),
-    "f_assigned_tcn",
-)
-sel_site_id    = _safe_multiselect("Site ID", df["Site ID"] if "Site ID" in df.columns else pd.Series([], dtype=object), "f_site_id")
-sel_prod_group = _safe_multiselect("Product Group", df["Product Group"] if "Product Group" in df.columns else pd.Series([], dtype=object), "f_prod_group")
+    brands = None
+    suppliers = None
 
-has_brand = "Brand" in df.columns
-has_supplier = "Supplier" in df.columns
-sel_brand = _safe_multiselect("Brand", df["Brand"], "f_brand") if has_brand else []
-sel_supplier = _safe_multiselect("Supplier", df["Supplier"], "f_supplier") if has_supplier else []
+    if "Brand" in df_scenario.columns:
+        opt_brands = sorted(df_scenario["Brand"].dropna().astype(str).unique().tolist())
+        brands = st.multiselect("Brand", opt_brands, default=[])
 
-# optional: separate markers by product group (slight offsets)
-st.sidebar.subheader("Map Options")
-separate_by_product = st.sidebar.toggle(
-    "Separate markers by Product Group (tiny offsets)",
-    value=False,
-    help="Plotly cannot truly 'stack' points at the same lat/lon. This option slightly offsets per product group.",
+    if "Supplier" in df_scenario.columns:
+        opt_suppliers = sorted(df_scenario["Supplier"].dropna().astype(str).unique().tolist())
+        suppliers = st.multiselect("Supplier", opt_suppliers, default=[])
+
+    st.divider()
+    st.subheader("Map options")
+    one_marker_per_site = st.toggle("One marker per Site ID", value=True)
+    offsets_enabled = st.toggle("Tiny offsets by Product Group", value=False, disabled=one_marker_per_site)
+
+# Apply filters
+df_filtered = apply_filters(
+    df=df,
+    scenario=scenario,
+    terminals=terminals,
+    tcns=tcns,
+    site_ids=site_ids,
+    products=products,
+    brands=brands,
+    suppliers=suppliers,
+    global_search=global_search.strip(),
 )
 
-# --- Filter pipeline
-df_f = df.copy()
-if scenario and "Scenario" in df_f.columns:
-    df_f = df_f[df_f["Scenario"] == scenario]
+# KPIs (only rows/sites/impacted shown; include scenario totals as subtle reference)
+k = kpis(df_scenario, df_filtered)
 
-df_f = apply_in(df_f, "New Terminal", sel_assigned_terminal)
-df_f = apply_in(df_f, "New TCN", sel_assigned_tcn)
-df_f = apply_in(df_f, "Site ID", sel_site_id)
-df_f = apply_in(df_f, "Product Group", sel_prod_group)
-if has_brand:
-    df_f = apply_in(df_f, "Brand", sel_brand)
-if has_supplier:
-    df_f = apply_in(df_f, "Supplier", sel_supplier)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("Rows (filtered)", f"{k['rows']:,}")
+c2.metric("Sites (filtered)", f"{k['sites']:,}")
+c3.metric("Impacted Sites (filtered)", f"{k['impacted_sites']:,}")
+c4.metric("Rows (scenario)", f"{k['scenario_rows']:,}")
+c5.metric("Sites (scenario)", f"{k['scenario_sites']:,}")
+c6.metric("Impacted Sites (scenario)", f"{k['scenario_impacted_sites']:,}")
 
-if search_q:
-    search_cols = [c for c in ["Site ID", "Product Group", "Brand", "Supplier", "Home Terminal", "New Terminal", "Home TCN", "New TCN", "Scenario"] if c in df_f.columns]
-    blob = df_f[search_cols].astype(str).agg(" | ".join, axis=1)
-    df_f = df_f[blob.str.contains(search_q, case=False, na=False)]
+st.divider()
 
-st.caption(f"Filtered rows: {len(df_f):,}")
-
-# --- Single-scenario page: remove cost KPIs (keep only assignment-impact context)
-impacted_sites = None
-if "Home Terminal" in df_f.columns and "New Terminal" in df_f.columns and "Site ID" in df_f.columns:
-    impacted_sites = df_f.loc[df_f["Home Terminal"] != df_f["New Terminal"], "Site ID"].nunique()
-
-site_count = df_f["Site ID"].nunique() if "Site ID" in df_f.columns else None
-row_count = len(df_f)
-
-k1, k2, k3 = st.columns(3)
-k1.metric("Rows", f"{row_count:,}")
-k2.metric("Sites", f"{site_count:,}" if isinstance(site_count, (int, np.integer)) else "N/A")
-k3.metric("Impacted Sites", f"{impacted_sites:,}" if isinstance(impacted_sites, (int, np.integer)) else "N/A")
-
-# --- Layout: map (left) + details (right)
-st.subheader("Map (sites colored by Assigned Terminal)")
-
-left, right = st.columns([2.2, 1.0], gap="large")
-
-selected_site_id = st.session_state.get("selected_site_id", "")
+# -----------------------------
+# Map + Details layout
+# -----------------------------
+left, right = st.columns([0.62, 0.38], gap="large")
 
 with left:
-    if lat_col and lon_col and (lat_col in df_f.columns) and (lon_col in df_f.columns):
-        df_map_raw = df_f.dropna(subset=[lat_col, lon_col]).copy()
-        if len(df_map_raw) == 0:
-            st.info("No mappable rows after filtering (missing lat/lon).")
-        else:
-            # Build map points:
-            # - Default: one marker per site
-            # - Optional: slight offsets per product group
-            if separate_by_product and "Product Group" in df_map_raw.columns:
-                offsets = {
-                    "Regular": (0.00025, 0.00025),
-                    "Premium": (0.00025, -0.00025),
-                    "Diesel": (-0.00025, 0.00025),
-                }
-                # for any non-standard product group values, keep no offset
-                def _off_lat(pg): return offsets.get(str(pg), (0.0, 0.0))[0]
-                def _off_lon(pg): return offsets.get(str(pg), (0.0, 0.0))[1]
-                df_pts = df_map_raw.copy()
-                df_pts["_lat_plot"] = df_pts[lat_col].astype(float) + df_pts["Product Group"].map(_off_lat).astype(float)
-                df_pts["_lon_plot"] = df_pts[lon_col].astype(float) + df_pts["Product Group"].map(_off_lon).astype(float)
-                color_col = "New Terminal" if "New Terminal" in df_pts.columns else None
-                hover_cols = [c for c in ["Site ID", "Product Group", "Brand", "New Terminal", "New TCN"] if c in df_pts.columns]
-                fig = px.scatter_map(
-                    df_sites,
-                    lat="_lat_plot",
-                    lon="_lon_plot",
-                    color="New Terminal" if "New Terminal" in df_sites.columns else None,
-                    hover_name=None,
-                    zoom=4,
-                    map_style="open-street-map",
-                )
-                # custom hover without lat/lon
-                custom = np.stack([
-                    df_pts["Site ID"].astype(str) if "Site ID" in df_pts.columns else pd.Series([""]*len(df_pts)),
-                    df_pts["Product Group"].astype(str) if "Product Group" in df_pts.columns else pd.Series([""]*len(df_pts)),
-                    df_pts["Brand"].astype(str) if "Brand" in df_pts.columns else pd.Series([""]*len(df_pts)),
-                    df_pts["New Terminal"].astype(str) if "New Terminal" in df_pts.columns else pd.Series([""]*len(df_pts)),
-                    df_pts["New TCN"].astype(str) if "New TCN" in df_pts.columns else pd.Series([""]*len(df_pts)),
-                ], axis=1)
-                fig.update_traces(
-                    customdata=custom,
-                    hovertemplate=(
-                        "<b>Site ID:</b> %{customdata[0]}<br>"
-                        "<b>Product:</b> %{customdata[1]}<br>"
-                        "<b>Brand:</b> %{customdata[2]}<br>"
-                        "<b>Assigned Terminal:</b> %{customdata[3]}<br>"
-                        "<b>Assigned TCN:</b> %{customdata[4]}<extra></extra>"
-                    ),
-                )
-            else:
-                # One marker per site (aggregate)
-                def _assigned_terminal_for_site(s: pd.Series) -> str:
-                    vals = s.dropna().astype(str).unique().tolist()
-                    if len(vals) == 1:
-                        return vals[0]
-                    if len(vals) == 0:
-                        return ""
-                    return "Multiple"
+    st.subheader("Map")
 
-                agg = {
-                    lat_col: "first",
-                    lon_col: "first",
-                    "New Terminal": _assigned_terminal_for_site if "New Terminal" in df_map_raw.columns else "first",
-                }
-                if "Brand" in df_map_raw.columns:
-                    agg["Brand"] = "first"
-                if "New TCN" in df_map_raw.columns:
-                    agg["New TCN"] = "first"
+    df_map_src = df_filtered.copy()
+    df_map_src["Lat"] = pd.to_numeric(df_map_src["Lat"], errors="coerce")
+    df_map_src["Lon"] = pd.to_numeric(df_map_src["Lon"], errors="coerce")
+    df_map_src = df_map_src.dropna(subset=["Lat", "Lon"])
 
-                df_sites = df_map_raw.groupby("Site ID", as_index=False).agg(agg)
-                df_sites["_lat_plot"] = df_sites[lat_col].astype(float)
-                df_sites["_lon_plot"] = df_sites[lon_col].astype(float)
-
-                fig = px.scatter_map(
-                    df_sites,
-                    lat="_lat_plot",
-                    lon="_lon_plot",
-                    color="New Terminal" if "New Terminal" in df_sites.columns else None,
-                    hover_name=None,
-                    zoom=4,
-                    map_style="open-street-map",
-                )
-
-                custom = np.stack([
-                    df_sites["Site ID"].astype(str),
-                    df_sites["Brand"].astype(str) if "Brand" in df_sites.columns else pd.Series([""]*len(df_sites)),
-                    df_sites["New Terminal"].astype(str) if "New Terminal" in df_sites.columns else pd.Series([""]*len(df_sites)),
-                    df_sites["New TCN"].astype(str) if "New TCN" in df_sites.columns else pd.Series([""]*len(df_sites)),
-                ], axis=1)
-
-                fig.update_traces(
-                    customdata=custom,
-                    hovertemplate=(
-                        "<b>Site ID:</b> %{customdata[0]}<br>"
-                        "<b>Brand:</b> %{customdata[1]}<br>"
-                        "<b>Assigned Terminal:</b> %{customdata[2]}<br>"
-                        "<b>Assigned TCN:</b> %{customdata[3]}<extra></extra>"
-                    ),
-                )
-
-            # Auto-center + auto-zoom based on filtered extents (use original lat/lon bounds)
-            lat_min = float(df_map_raw[lat_col].astype(float).min())
-            lat_max = float(df_map_raw[lat_col].astype(float).max())
-            lon_min = float(df_map_raw[lon_col].astype(float).min())
-            lon_max = float(df_map_raw[lon_col].astype(float).max())
-
-            center_lat = float(df_map_raw[lat_col].astype(float).mean())
-            center_lon = float(df_map_raw[lon_col].astype(float).mean())
-            z = zoom_from_bounds(lat_min, lat_max, lon_min, lon_max)
-
-            fig.update_layout(
-                margin={"l": 0, "r": 0, "t": 0, "b": 0},
-                map={"center": {"lat": center_lat, "lon": center_lon}, "zoom": z, "style": "open-street-map"},
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=0.01,
-                    xanchor="left",
-                    x=0.01,
-                    bgcolor="rgba(0,0,0,0)",
-                ),
-            )
-            fig.update_traces(marker={"size": 16, "opacity": 0.95})
-
-            # Remove the modebar so it doesn't cover the legend
-            fig.update_layout(modebar_remove=["zoom", "pan", "select", "lasso2d", "zoomIn", "zoomOut", "autoScale", "resetScale"])
-
-            click_data = plotly_events(
-                fig,
-                click_event=True,
-                hover_event=False,
-                select_event=False,
-                override_height=620,
-                key="map_events",
-            )
-
-            # Map-click -> details panel
-            if click_data and isinstance(click_data, list) and len(click_data) > 0:
-                pt = click_data[0]
-                # For px.scatter_map, customdata is accessible via pointNumber indexing in the underlying trace,
-                # but plotly_events returns pointNumber + curveNumber.
-                # We can use pointIndex to look up from the plotted dataframe by aligning order:
-                # Safer: store Site ID in hovertext is off; instead infer from selected trace's customdata order.
-                # plotly_events includes "pointIndex" in newer versions; fall back to "pointNumber".
-                idx = pt.get("pointIndex", pt.get("pointNumber", None))
-                if idx is not None:
-                    # Determine which dataframe was used for the map
-                    if separate_by_product and "Product Group" in df_map_raw.columns:
-                        site_id_clicked = str(df_map_raw.reset_index(drop=True).iloc[int(idx)]["Site ID"])
-                    else:
-                        site_id_clicked = str(df_map_raw.groupby("Site ID", as_index=False).size().iloc[int(idx)]["Site ID"])
-                    st.session_state["selected_site_id"] = site_id_clicked
-                    selected_site_id = site_id_clicked
+    if df_map_src.empty:
+        st.info("No mappable rows after filters.")
+        clicked = []
     else:
-        st.info("Map disabled: Latitude/Longitude columns not found (accepted: Latitude/Lat and Longitude/Lon/Lng/Long).")
+        if one_marker_per_site:
+            agg = {
+                "Lat": "first",
+                "Lon": "first",
+                "Assigned Terminal": "first",
+                "Assigned TCN": "first",
+            }
+            for opt in ["Brand", "Supplier", "Home Terminal"]:
+                if opt in df_map_src.columns:
+                    agg[opt] = "first"
+
+            df_plot = df_map_src.groupby("Site ID", as_index=False).agg(agg)
+
+            prod_summary = (
+                df_map_src.groupby("Site ID")["Product Group"]
+                .apply(lambda s: ", ".join(sorted(pd.unique(s.dropna().astype(str)))))
+                .rename("Products")
+                .reset_index()
+            )
+            df_plot = df_plot.merge(prod_summary, on="Site ID", how="left")
+
+            df_plot["lat_plot"] = df_plot["Lat"].astype(float)
+            df_plot["lon_plot"] = df_plot["Lon"].astype(float)
+
+            custom_cols = ["Site ID", "Products", "Assigned Terminal", "Assigned TCN"]
+            for opt in ["Brand", "Supplier", "Home Terminal"]:
+                if opt in df_plot.columns:
+                    custom_cols.append(opt)
+
+            hovertemplate = (
+                "<b>Site:</b> %{customdata[0]}<br>"
+                "<b>Products:</b> %{customdata[1]}<br>"
+                "<b>Assigned Terminal:</b> %{customdata[2]}<br>"
+                "<b>Assigned TCN:</b> %{customdata[3]}<br>"
+            )
+            idx = 4
+            for opt_label in ["Brand", "Supplier", "Home Terminal"]:
+                if opt_label in df_plot.columns:
+                    hovertemplate += f"<b>{opt_label}:</b> %{{customdata[{idx}]}}<br>"
+                    idx += 1
+            hovertemplate += "<extra></extra>"
+        else:
+            df_plot = df_map_src.copy()
+            if offsets_enabled:
+                df_plot = _apply_product_offsets(df_plot, lat_col="Lat", lon_col="Lon", group_col="Product Group")
+            else:
+                df_plot["lat_plot"] = df_plot["Lat"].astype(float)
+                df_plot["lon_plot"] = df_plot["Lon"].astype(float)
+
+            custom_cols = ["Site ID", "Product Group", "Assigned Terminal", "Assigned TCN"]
+            for opt in ["Brand", "Supplier", "Home Terminal"]:
+                if opt in df_plot.columns:
+                    custom_cols.append(opt)
+
+            hovertemplate = (
+                "<b>Site:</b> %{customdata[0]}<br>"
+                "<b>Product:</b> %{customdata[1]}<br>"
+                "<b>Assigned Terminal:</b> %{customdata[2]}<br>"
+                "<b>Assigned TCN:</b> %{customdata[3]}<br>"
+            )
+            idx = 4
+            for opt_label in ["Brand", "Supplier", "Home Terminal"]:
+                if opt_label in df_plot.columns:
+                    hovertemplate += f"<b>{opt_label}:</b> %{{customdata[{idx}]}}<br>"
+                    idx += 1
+            hovertemplate += "<extra></extra>"
+
+        lat_min, lat_max = df_plot["lat_plot"].min(), df_plot["lat_plot"].max()
+        lon_min, lon_max = df_plot["lon_plot"].min(), df_plot["lon_plot"].max()
+        center = {"lat": float((lat_min + lat_max) / 2.0), "lon": float((lon_min + lon_max) / 2.0)}
+        zoom = _mapbox_zoom_from_bounds(lat_min, lat_max, lon_min, lon_max)
+
+        fig = px.scatter_mapbox(
+            df_plot,
+            lat="lat_plot",
+            lon="lon_plot",
+            color="Assigned Terminal",
+            custom_data=custom_cols,
+            zoom=zoom,
+            center=center,
+            height=720,
+        )
+
+        fig.update_layout(
+            mapbox=dict(style="open-street-map"),
+            margin=dict(l=0, r=0, t=0, b=0),
+            legend=dict(
+                x=0.01,
+                y=0.01,
+                xanchor="left",
+                yanchor="bottom",
+                bgcolor="rgba(255,255,255,0.75)",
+                borderwidth=0,
+                orientation="v",
+            ),
+        )
+
+        fig.update_traces(
+            hovertemplate=hovertemplate,
+            marker=dict(size=10),
+        )
+
+        plotly_config = {"displayModeBar": False, "scrollZoom": True}
+
+        clicked = plotly_events(
+            fig,
+            click_event=True,
+            hover_event=False,
+            select_event=False,
+            override_height=720,
+            override_width="100%",
+            config=plotly_config,
+            key="map_click",
+        )
+
+        if clicked and "customdata" in clicked[0] and clicked[0]["customdata"]:
+            st.session_state["selected_site_id"] = str(clicked[0]["customdata"][0])
 
 with right:
-    st.markdown("### Site details")
-    if selected_site_id:
-        site_rows = df_f[df_f["Site ID"] == selected_site_id].copy()
+    st.subheader("Details")
 
-        # Display fields (no lat/lon)
-        def _uniq_or_multiple(col: str) -> str:
-            if col not in site_rows.columns:
-                return ""
-            vals = site_rows[col].dropna().astype(str).unique().tolist()
-            if len(vals) == 1:
-                return vals[0]
-            if len(vals) == 0:
-                return ""
-            return "Multiple"
-
-        st.write(f"**Site ID:** {selected_site_id}")
-        if "Brand" in site_rows.columns:
-            st.write(f"**Brand:** {_uniq_or_multiple('Brand')}")
-        st.write(f"**Assigned Terminal:** {_uniq_or_multiple('New Terminal')}")
-        st.write(f"**Assigned TCN:** {_uniq_or_multiple('New TCN')}")
-        if "Supplier" in site_rows.columns:
-            st.write(f"**Supplier:** {_uniq_or_multiple('Supplier')}")
-        if "Home Terminal" in site_rows.columns:
-            st.write(f"**Home Terminal:** {_uniq_or_multiple('Home Terminal')}")
-        if "Home TCN" in site_rows.columns:
-            st.write(f"**Home TCN:** {_uniq_or_multiple('Home TCN')}")
-
-        st.markdown("#### Product breakdown")
-        cols = [c for c in ["Product Group", "Total Cost (30 days)", "Freight Cost (30 days)", "Product Cost (30 days)"] if c in site_rows.columns]
-        if cols:
-            st.dataframe(site_rows[cols], width="stretch", height=260)
-        else:
-            st.write("No cost columns available for breakdown.")
+    selected_site = st.session_state.get("selected_site_id", "")
+    if selected_site:
+        st.caption(f"Selected Site ID: {selected_site}")
+        df_details = df_filtered[df_filtered["Site ID"].astype(str) == selected_site].copy()
+        # Hide lat/lon in details table
+        hide_cols = [c for c in ["Lat", "Lon"] if c in df_details.columns]
+        st.dataframe(df_details.drop(columns=hide_cols), use_container_width=True, hide_index=True)
     else:
-        st.write("Click a site on the map to view details here.")
+        st.info("Click a site on the map to see details.")
 
-# Filtered data table (hide lat/lon columns)
+st.divider()
+
+# -----------------------------
+# Filtered table (lat/lon hidden)
+# -----------------------------
 st.subheader("Filtered Data")
-df_display = df_f.drop(columns=[c for c in [lat_col, lon_col] if c], errors="ignore")
-st.dataframe(df_display, width="stretch", height=520)
+df_table = df_filtered.copy()
+hide_cols = [c for c in ["Lat", "Lon"] if c in df_table.columns]
+st.dataframe(df_table.drop(columns=hide_cols), use_container_width=True, hide_index=True)
