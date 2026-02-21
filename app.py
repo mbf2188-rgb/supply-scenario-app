@@ -178,12 +178,13 @@ with left:
                 color_col = "New Terminal" if "New Terminal" in df_pts.columns else None
                 hover_cols = [c for c in ["Site ID", "Product Group", "Brand", "New Terminal", "New TCN"] if c in df_pts.columns]
                 fig = px.scatter_map(
-                    df_pts,
+                    df_sites,
                     lat="_lat_plot",
                     lon="_lon_plot",
-                    color=color_col,
+                    color="New Terminal" if "New Terminal" in df_sites.columns else None,
                     hover_name=None,
                     zoom=4,
+                    map_style="open-street-map",
                 )
                 # custom hover without lat/lon
                 custom = np.stack([
@@ -234,6 +235,7 @@ with left:
                     color="New Terminal" if "New Terminal" in df_sites.columns else None,
                     hover_name=None,
                     zoom=4,
+                    map_style="open-street-map",
                 )
 
                 custom = np.stack([
@@ -265,14 +267,14 @@ with left:
 
             fig.update_layout(
                 margin={"l": 0, "r": 0, "t": 0, "b": 0},
-                mapbox={"center": {"lat": center_lat, "lon": center_lon}, "zoom": z},
+                map={"center": {"lat": center_lat, "lon": center_lon}, "zoom": z, "style": "open-street-map"},
                 legend=dict(
                     orientation="h",
                     yanchor="bottom",
                     y=0.01,
                     xanchor="left",
                     x=0.01,
-                    bgcolor="rgba(0,0,0,0)",  # transparent
+                    bgcolor="rgba(0,0,0,0)",
                 ),
             )
             fig.update_traces(marker={"size": 16, "opacity": 0.95})
