@@ -9,7 +9,7 @@ CANONICAL_COLUMNS: List[str] = [
     "Product Group",
     "Brand",
     "Supplier",
-    "Carrier",
+    "Assigned Carrier",
     "Home Terminal",
     "New Terminal",
     "Home TCN",
@@ -46,16 +46,19 @@ EXPLORER_COLUMNS = [
     "Site ID",
     "Brand",
     "Product Group",
-    "Monthly volume",
-    "Carrier",
     "Home Terminal",
     "New Terminal",
+    "Home TCN",
     "New TCN",
     "Primary Freight Rate",
     "New Freight Rate",
     "Primary Supply Rate",
     "New Supply Rate",
+    "Freight Cost (30 days)",
+    "Product Cost (30 days)",
+    "Total Cost (30 days)",
 ]
+
 
 PRODUCT_GROUPS = ["Regular", "Premium", "Diesel"]
 ANNUALIZATION_FACTOR = 365 / 30
@@ -68,8 +71,8 @@ COLUMN_VARIANTS: Dict[str, str] = {
     "product group": "Product Group",
     "brand": "Brand",
     "supplier": "Supplier",
-    "assigned carrier": "Carrier",
-    "carrier": "Carrier",
+    "assigned carrier": "Assigned Carrier",
+    "carrier": "Assigned Carrier",
     "home terminal": "Home Terminal",
     "home terminal ": "Home Terminal",
     "new terminal": "New Terminal",
