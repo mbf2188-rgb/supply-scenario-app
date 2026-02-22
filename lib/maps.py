@@ -61,7 +61,7 @@ def build_map_figure(df_plot: pd.DataFrame):
         center={"lat": center_lat, "lon": center_lon},
         zoom=zoom,
         height=680,
-        height=620,
+        width=620,
     )
     fig.update_layout(
         mapbox={"style": "open-street-map", "center": {"lat": center_lat, "lon": center_lon}, "zoom": zoom},
