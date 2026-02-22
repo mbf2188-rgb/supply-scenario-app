@@ -6,23 +6,14 @@ import subprocess
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from streamlit_plotly_events import plotly_events
 
-from lib.constants import ANNUALIZATION_FACTOR, EXPLORER_COLUMNS
 from lib.export import build_html_report, export_product_group_images, fig_to_html
 from lib.io import load_uploaded_file
-from lib.maps import build_map_df, build_map_figure
-from lib.metrics import (
-    changed_sites_only,
-    delta_by_group,
-    delta_totals,
-    impacted_sites_compare,
-    impacted_sites_overview,
-    terminal_shift_matrix,
-    volume_by_product_tcn,
-    volume_by_terminal_product,
-)
+from lib.maps import build_map_df, build_map_figure, product_groups_available
+from lib.metrics import changed_sites_only, delta_vs_baseline, impacted_sites, terminal_shift_matrix, totals, volume_by_terminal_product
 from lib.normalize import normalize_dataset
-from lib.ui import apply_theme, choose_scenario_defaults, explorer_table, global_filter, paginated_table, safe_dataframe
+from lib.ui import apply_theme, choose_scenario_defaults, explorer_table, global_filter, paginated_table
 
 
 def _git_short_sha() -> str:
@@ -32,62 +23,9 @@ def _git_short_sha() -> str:
         return "unknown"
 
 
-def _volume_column(df: pd.DataFrame, units: str) -> tuple[pd.DataFrame, str, str]:
-    out = df.copy()
-    if units == "bbl/day":
-        return out, "Daily Volume (bbl)", ""
-    if units == "bbl/month":
-        return out, "Monthly Volume (bbl 30 day)", ""
-    if units == "gal/day":
-        return out, "Daily Volume (gal)", ""
-    if units == "gal/month":
-        return out, "Monthly Volume (gal 30 day)", ""
-
-    if units == "bbl/yr":
-        if "Daily Volume (bbl)" in out.columns:
-            out["__volume_year"] = pd.to_numeric(out["Daily Volume (bbl)"], errors="coerce") * 365
-            return out, "__volume_year", "Derived bbl/yr from Daily Volume (bbl) × 365"
-        out["__volume_year"] = pd.to_numeric(out["Monthly Volume (bbl 30 day)"], errors="coerce") * (365 / 30)
-        return out, "__volume_year", "Derived bbl/yr from Monthly Volume (bbl 30 day) × (365/30)"
-
-    if "Daily Volume (gal)" in out.columns:
-        out["__volume_year"] = pd.to_numeric(out["Daily Volume (gal)"], errors="coerce") * 365
-        return out, "__volume_year", "Derived gal/yr from Daily Volume (gal) × 365"
-    out["__volume_year"] = pd.to_numeric(out["Monthly Volume (gal 30 day)"], errors="coerce") * (365 / 30)
-    return out, "__volume_year", "Derived gal/yr from Monthly Volume (gal 30 day) × (365/30)"
-
-
-def _default_new_scenario(scenarios: list[str], baseline: str) -> str:
-    for s in scenarios:
-        if s != baseline:
-            return s
-    return baseline
-
-
-def _format_explorer(df: pd.DataFrame) -> pd.DataFrame:
-    out = explorer_table(df).copy()
-    rate_cols = ["Primary Freight Rate", "New Freight Rate", "Primary Supply Rate", "New Supply Rate"]
-    cost_cols = ["Freight Cost (30 days)", "Product Cost (30 days)", "Total Cost (30 days)"]
-
-    for col in rate_cols:
-        out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
-    for col in cost_cols:
-        out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
-
-    out = out.rename(
-        columns={
-            "Primary Freight Rate": "Primary Freight Rate (¢/gal)",
-            "New Freight Rate": "New Freight Rate (¢/gal)",
-            "Primary Supply Rate": "Primary Supply Rate (¢/gal)",
-            "New Supply Rate": "New Supply Rate (¢/gal)",
-        }
-    )
-    return out
-
-
 def main() -> None:
-    st.set_page_config(layout="wide", page_title="Supply & Freight Scenario Viewer")
-    st.title("Supply & Freight Scenario Viewer")
+    st.set_page_config(layout="wide", page_title="Supply + Freight Scenario Viewer")
+    st.title("Supply + Freight Scenario Viewer")
     st.caption(f"Build: {_git_short_sha()}")
 
     uploaded_file = st.file_uploader("Upload scenario file (.csv or .xlsx)", type=["csv", "xlsx"])
@@ -95,8 +33,8 @@ def main() -> None:
         st.info("Upload a CSV or XLSX file to begin.")
         st.stop()
 
-    dark_mode = st.sidebar.toggle("Dark mode", value=False)
-    apply_theme(dark_mode)
+    night_mode = st.sidebar.toggle("Night mode", value=False)
+    apply_theme(night_mode)
 
     try:
         raw = load_uploaded_file(uploaded_file.getvalue(), uploaded_file.name)
@@ -117,161 +55,146 @@ def main() -> None:
         st.write("Original to canonical mapping:", norm.column_map)
         st.write("Columns:", list(df.columns))
 
-    # Global controls
     search = st.sidebar.text_input("Global free-text search", value="").strip()
     filtered = global_filter(df, search)
 
-    units = st.sidebar.selectbox("Global volume units", ["bbl/day", "bbl/month", "bbl/yr", "gal/day", "gal/month", "gal/yr"], index=0)
-    filtered, volume_col, volume_note = _volume_column(filtered, units)
-    if volume_note:
-        st.sidebar.caption(volume_note)
+    scenarios = sorted(filtered["Scenario"].dropna().astype(str).unique().tolist())
+    default_baseline, default_display = choose_scenario_defaults(scenarios)
+    baseline = st.sidebar.selectbox("Baseline scenario", scenarios, index=scenarios.index(default_baseline) if default_baseline in scenarios else 0)
+    display = st.sidebar.selectbox("Scenario to display", scenarios, index=scenarios.index(default_display) if default_display in scenarios else 0)
 
-    global_filters = ["New Terminal", "New TCN", "Site ID", "Product Group", "Brand", "Assigned Carrier"]
-    for label in global_filters:
+    scenario_filter = st.sidebar.multiselect("Scenario filter", scenarios, default=[])
+    if scenario_filter:
+        filtered = filtered[filtered["Scenario"].astype(str).isin(scenario_filter)]
+
+    units = st.sidebar.selectbox("Volume units", ["bbl/day", "bbl/month", "gal/day", "gal/month"], index=0)
+
+    for label in ["New Terminal", "New TCN", "Site ID", "Product Group", "Brand", "Supplier"]:
         if label in filtered.columns:
-            options = sorted(filtered[label].dropna().astype(str).unique().tolist())
-            selected = st.sidebar.multiselect(label, options=options, default=[])
+            choices = sorted(filtered[label].dropna().astype(str).unique().tolist())
+            selected = st.sidebar.multiselect(label, choices, default=[])
             if selected:
                 filtered = filtered[filtered[label].astype(str).isin(selected)]
 
-    scenarios = sorted(filtered["Scenario"].dropna().astype(str).unique().tolist())
-    if not scenarios:
-        st.warning("No scenarios available after current filters.")
+    if units == "bbl/day":
+        volume_col = "Daily Volume (bbl)"
+    elif units == "bbl/month":
+        volume_col = "Monthly Volume (bbl 30 day)"
+    elif units == "gal/day":
+        volume_col = "Daily Volume (gal)"
+    else:
+        volume_col = "Monthly Volume (gal 30 day)"
+
+    if volume_col not in filtered.columns:
+        st.error(f"Selected units require volume column: {volume_col}")
         st.stop()
 
-    default_primary, default_secondary = choose_scenario_defaults(scenarios)
+    selected_df = filtered[filtered["Scenario"].astype(str) == display].copy()
 
-    # Export controls near top
-    e1, e2 = st.columns([1, 2])
-    with e1:
-        export_images = st.checkbox("Export map images (Regular/Premium/Diesel)", value=False)
-        export_clicked = st.button("Export HTML report")
-    with e2:
-        st.caption("Export reflects current tab selections and global filters.")
+    k1, k2, k3 = st.columns(3)
+    sel_tot = totals(selected_df)
+    with k1:
+        st.metric("Sites", int(selected_df["Site ID"].nunique()))
+    with k2:
+        st.metric("Impacted Sites", impacted_sites(selected_df))
+    with k3:
+        st.metric("Total Cost (1 year)", f"${sel_tot['total_1y']:,.0f}")
 
-    compare_tab, overview_tab, explorer_tab = st.tabs(["Compare Scenarios", "Scenario Overview", "Data Explorer"])
-
-    # Shared objects for export
-    compare_fig = None
-    overview_fig = None
-    map_fig = None
-    compare_table = pd.DataFrame()
-    overview_table = pd.DataFrame()
-
-    with compare_tab:
-        baseline = st.selectbox("Baseline scenario", scenarios, index=scenarios.index(default_primary), key="cmp_base")
-        default_new = _default_new_scenario(scenarios, baseline)
-        new_scenario = st.selectbox("New scenario", scenarios, index=scenarios.index(default_new), key="cmp_new")
-        changed_only = st.checkbox("Changed sites only (New Terminal differs)", value=True)
-
-        compare_df = filtered[filtered["Scenario"].astype(str).isin([baseline, new_scenario])].copy()
-        if changed_only:
-            compare_df = changed_sites_only(compare_df, baseline, new_scenario)
-
-        deltas = delta_totals(compare_df, baseline, new_scenario)
-        impacted = impacted_sites_compare(filtered, baseline, new_scenario)
-
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Impacted Sites", impacted)
-        k2.metric("Δ Total Cost (30-day)", f"${deltas['delta_total_30']:,.0f}")
-        k3.metric("Δ Total Cost (1-year)", f"${deltas['delta_total_1y']:,.0f}")
-        k4.metric("Δ Freight Cost (30-day)", f"${deltas['delta_freight_30']:,.0f}")
-        k5.metric("Δ Supply Cost (30-day)", f"${deltas['delta_supply_30']:,.0f}")
-
-        delta_terminal_pg = delta_by_group(compare_df, baseline, new_scenario, ["New Terminal", "Product Group"], "Total Cost (30 days)")
-        st.subheader("Delta cost by New Terminal × Product Group")
-        safe_dataframe(delta_terminal_pg)
-
-        delta_brand = delta_by_group(compare_df, baseline, new_scenario, ["Brand"], "Total Cost (30 days)")
-        st.subheader("Delta cost by Brand")
-        safe_dataframe(delta_brand)
-
-        if "Assigned Carrier" in compare_df.columns:
-            delta_carrier = delta_by_group(compare_df, baseline, new_scenario, ["Assigned Carrier"], "Total Cost (30 days)")
-            st.subheader("Delta cost by Assigned Carrier")
-            safe_dataframe(delta_carrier)
-
-        delta_tcn = delta_by_group(compare_df, baseline, new_scenario, ["New TCN"], "Total Cost (30 days)")
-        st.subheader("Delta cost by New TCN")
-        safe_dataframe(delta_tcn)
-
-        delta_volume = delta_by_group(compare_df, baseline, new_scenario, ["New Terminal", "Product Group"], volume_col)
-        delta_volume = delta_volume.rename(columns={"delta_30": f"delta_{units}"})
-        st.subheader(f"Delta volume by New Terminal × Product Group ({units})")
-        safe_dataframe(delta_volume)
-
-        compare_table = delta_terminal_pg.copy()
-        if not compare_table.empty:
-            compare_fig = px.bar(compare_table.head(20), x="New Terminal", y="delta_30", color="Product Group", title="Δ Cost (30-day)")
+    overview_tab, compare_tab, explorer_tab = st.tabs(["Overview", "Compare", "Explorer"])
 
     with overview_tab:
-        scenario_overview = st.selectbox("Scenario", scenarios, index=scenarios.index(default_primary), key="ov_scenario")
-        ov_df = filtered[filtered["Scenario"].astype(str) == scenario_overview].copy()
+        delta = delta_vs_baseline(filtered, baseline, display)
+        wins = delta.nsmallest(10, "delta_30")
+        losses = delta.nlargest(10, "delta_30")
 
-        st.metric("Impacted Sites", impacted_sites_overview(ov_df))
+        left, right = st.columns(2)
+        with left:
+            st.subheader("Top wins vs baseline (30-day delta)")
+            st.dataframe(wins[["Site ID", "Product Group", "delta_30", "delta_1y"]], use_container_width=True)
+        with right:
+            st.subheader("Top losses vs baseline (30-day delta)")
+            st.dataframe(losses[["Site ID", "Product Group", "delta_30", "delta_1y"]], use_container_width=True)
 
-        vol_terminal = volume_by_terminal_product(ov_df, volume_col)
-        st.subheader(f"Volume by Product Group × New Terminal ({units})")
-        safe_dataframe(vol_terminal)
+        shift = terminal_shift_matrix(selected_df)
+        st.subheader("Terminal shift matrix (Home → New)")
+        st.dataframe(shift, use_container_width=True)
 
-        vol_tcn = volume_by_product_tcn(ov_df, volume_col)
-        st.subheader(f"Volume by Product Group × New TCN ({units})")
-        safe_dataframe(vol_tcn)
+        ranked = selected_df.groupby("New Terminal", as_index=False)[volume_col].sum().sort_values(volume_col, ascending=False)
+        st.subheader(f"Volume ranked by New Terminal ({units})")
+        st.dataframe(ranked, use_container_width=True)
 
-        shift = terminal_shift_matrix(ov_df, volume_col)
-        st.subheader(f"Home Terminal → New Terminal shift ({units})")
-        safe_dataframe(shift)
+    with compare_tab:
+        sx = st.selectbox("Scenario X", scenarios, index=scenarios.index(display) if display in scenarios else 0)
+        sy = st.selectbox("Scenario Y", scenarios, index=scenarios.index(baseline) if baseline in scenarios else 0)
+        changed_only = st.checkbox("Changed sites only (New TCN differs)", value=True)
 
-        map_df = build_map_df(ov_df, product_offset=True)
-        map_fig = build_map_figure(map_df)
-        if map_fig is not None:
-            st.subheader("Map")
-            st.plotly_chart(
-                map_fig,
-                use_container_width=True,
-                config={
-                    "displaylogo": False,
-                    "modeBarButtonsToRemove": ["select2d", "lasso2d"],
-                },
-            )
+        cmp_df = filtered[filtered["Scenario"].astype(str).isin([sx, sy])].copy()
+        if changed_only:
+            cmp_df = changed_sites_only(cmp_df, sx, sy)
 
-        overview_table = vol_terminal.copy()
-        if not vol_terminal.empty:
-            val_cols = [c for c in vol_terminal.columns if c != "New Terminal"]
-            if val_cols:
-                plot_df = vol_terminal.melt(id_vars=["New Terminal"], value_vars=val_cols, var_name="Product Group", value_name="Volume")
-                overview_fig = px.bar(plot_df, x="New Terminal", y="Volume", color="Product Group", title=f"Volume by Terminal ({units})")
+        tx, ty = totals(cmp_df[cmp_df["Scenario"].astype(str) == sx]), totals(cmp_df[cmp_df["Scenario"].astype(str) == sy])
+        metric_df = pd.DataFrame([{"Scenario": sx, **tx}, {"Scenario": sy, **ty}])
+        st.subheader("Scenario totals (30-day and 1-year)")
+        st.dataframe(metric_df, use_container_width=True)
+
+        matrix = volume_by_terminal_product(cmp_df, volume_col)
+        st.subheader(f"Volume matrix: New Terminal × Product Group ({units})")
+        st.dataframe(matrix, use_container_width=True)
 
     with explorer_tab:
-        st.subheader("Data Explorer")
-        display_df = _format_explorer(filtered)
-        if set(EXPLORER_COLUMNS).issubset(explorer_table(filtered).columns):
-            paginated_table(display_df, key="explorer")
-        else:
-            safe_dataframe(display_df)
+        pg_options = product_groups_available(selected_df)
+        selected_groups = st.multiselect("Map filter: Product Group", options=pg_options, default=pg_options)
+        map_df = selected_df[selected_df["Product Group"].astype(str).isin(selected_groups)] if selected_groups else selected_df.iloc[0:0]
 
-    if export_clicked:
+        map_df = build_map_df(map_df, product_offset=True)
+        fig = build_map_figure(map_df)
+        selected_site = ""
+        if fig is not None:
+            clicks = plotly_events(fig, click_event=True, hover_event=False, select_event=False, override_height=620, key="map_click")
+            if clicks:
+                cdata = clicks[0].get("customdata")
+                if isinstance(cdata, (list, tuple)) and cdata:
+                    selected_site = str(cdata[0])
+
+        st.subheader("Decision table")
+        ex = explorer_table(selected_df)
+        if selected_site:
+            st.caption(f"Selected site: {selected_site}")
+            ex = ex[ex["Site ID"].astype(str) == selected_site]
+        paginated_table(ex, key="explorer")
+
+    st.subheader("Export")
+    export_images = st.checkbox("Also export product-group map images (Regular/Premium/Diesel)", value=False)
+    if st.button("Export HTML report"):
         out_dir = Path("exports")
         out_dir.mkdir(exist_ok=True)
+
+        delta = delta_vs_baseline(filtered, baseline, display)
+        overview_fig = px.bar(
+            delta.sort_values("delta_30").tail(20),
+            x="Site ID",
+            y="delta_30",
+            color="Product Group",
+            title=f"Top deltas: {display} - {baseline} (30-day)",
+        )
+        compare_fig = px.bar(pd.DataFrame([{"Scenario": sx, **tx}, {"Scenario": sy, **ty}]).melt(id_vars=["Scenario"], value_vars=["freight_30", "supply_30", "total_30"]), x="Scenario", y="value", color="variable")
+        map_fig = build_map_figure(build_map_df(selected_df, product_offset=True))
+
         html_path = out_dir / "supply_scenario_report.html"
         build_html_report(
             output_path=html_path,
-            title="Supply & Freight Scenario Report",
+            title="Supply + Freight Scenario Report",
             overview_fig_html=fig_to_html(overview_fig),
             compare_fig_html=fig_to_html(compare_fig),
             map_fig_html=fig_to_html(map_fig),
-            overview_table=overview_table.head(500),
-            compare_table=compare_table.head(500),
-            explorer_table=_format_explorer(filtered).head(1000),
+            overview_table=delta.head(100),
+            compare_table=pd.DataFrame([{"Scenario": sx, **tx}, {"Scenario": sy, **ty}]),
+            explorer_table=explorer_table(selected_df).head(500),
         )
 
         if export_images:
             try:
-                images = export_product_group_images(
-                    filtered,
-                    lambda x: build_map_figure(build_map_df(x, product_offset=True)),
-                    out_dir / "maps",
-                )
+                images = export_product_group_images(selected_df, lambda x: build_map_figure(build_map_df(x, product_offset=True)), out_dir / "maps")
                 st.success(f"Export complete: {html_path} and {len(images)} map images")
             except Exception as exc:
                 st.warning(f"HTML exported ({html_path}), but PNG export failed: {exc}")
