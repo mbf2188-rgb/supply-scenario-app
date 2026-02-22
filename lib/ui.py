@@ -6,6 +6,20 @@ import streamlit as st
 from lib.constants import EXPLORER_COLUMNS
 
 
+def apply_theme() -> None:
+    """Apply a consistent 7-Eleven inspired style using Streamlit's active base theme."""
+    base = st.get_option("theme.base") or "light"
+    dark_mode = str(base).lower() == "dark"
+
+    bg = "#0b1220" if dark_mode else "#f4f7fb"
+    fg = "#e5e7eb" if dark_mode else "#111827"
+    sidebar_bg = "#0f1a30" if dark_mode else "#1f2937"  # always dark for filter contrast
+    sidebar_fg = "#f9fafb"
+    card_bg = "#111b31" if dark_mode else "#ffffff"
+    border = "#1f3a63" if dark_mode else "#c7d2e3"
+    accent_red = "#d71920"
+    accent_green = "#0a8f3d"
+    accent_orange = "#ff7a00"
 def apply_theme(dark_mode: bool) -> None:
     bg = "#0c1730" if dark_mode else "#f7f9fc"
     fg = "#e5e7eb" if dark_mode else "#111827"
@@ -19,6 +33,50 @@ def apply_theme(dark_mode: bool) -> None:
         f"""
         <style>
         .stApp {{ background: {bg}; color: {fg}; }}
+        [data-testid="stHeader"] {{ border-top: 3px solid {accent_red}; }}
+
+        [data-testid="stSidebar"] {{
+            background: linear-gradient(180deg, {sidebar_bg} 0%, #111827 100%);
+            color: {sidebar_fg};
+            border-right: 1px solid #26344f;
+        }}
+        [data-testid="stSidebar"] * {{ color: {sidebar_fg} !important; }}
+        [data-testid="stSidebar"] .stSelectbox label,
+        [data-testid="stSidebar"] .stMultiSelect label,
+        [data-testid="stSidebar"] .stTextInput label {{
+            font-size: 0.98rem !important;
+            font-weight: 600 !important;
+        }}
+        [data-testid="stSidebar"] input,
+        [data-testid="stSidebar"] textarea,
+        [data-testid="stSidebar"] [data-baseweb="select"] > div {{
+            background: #0b1220 !important;
+            color: #f9fafb !important;
+            border: 1px solid #334155 !important;
+            font-size: 1rem !important;
+        }}
+
+        [data-testid="stMetric"], [data-testid="stExpander"], [data-testid="stDataFrame"] {{
+            background: {card_bg};
+            border: 1px solid {border};
+            border-radius: 10px;
+        }}
+
+        .stTabs [data-baseweb="tab-list"] button {{
+            background: {card_bg};
+            border: 1px solid {border};
+            border-bottom: none;
+            border-radius: 8px 8px 0 0;
+            color: {fg};
+            font-weight: 600;
+        }}
+        .stTabs [aria-selected="true"] {{
+            border-top: 3px solid {accent_green} !important;
+            box-shadow: inset 0 -3px 0 {accent_orange};
+        }}
+
+        .stButton > button {{ border: 1px solid {accent_green}; }}
+        .stButton > button:hover {{ border-color: {accent_orange}; color: {accent_orange}; }}
         [data-testid="stSidebar"] {{ background: {card_bg}; border-right: 1px solid {border}; }}
         [data-testid="stMetric"] {{ background: {card_bg}; border: 1px solid {border}; border-radius: 10px; padding: 10px; }}
         [data-testid="stExpander"] {{ background: {card_bg}; border: 1px solid {border}; border-radius: 10px; }}
