@@ -71,23 +71,21 @@ def build_map_figure(df_plot: pd.DataFrame):
     )
 
     fig.update_traces(
-        customdata=np.column_stack([
-            df_plot["Site ID"].astype(str),
-            df_plot.get("Product Group", "").astype(str),
-            df_plot["_terminal"].astype(str),
-            df_plot["_tcn"].astype(str),
-        ]),
-        hovertemplate=(
-            "<b>Site:</b> %{customdata[0]}"
-            "<br><b>Product:</b> %{customdata[1]}"
-            "<br><b>New Terminal:</b> %{customdata[2]}"
-            "<br><b>New TCN:</b> %{customdata[3]}<extra></extra>"
-        ),
-            df_plot.get("New TCN", "").astype(str),
-        ),
-        hovertemplate="<b>Site:</b> %{customdata[0]}<br><b>Product:</b> %{customdata[1]}<br><b>Terminal:</b> %{customdata[2]}<extra></extra>",
-        marker={"size": 11, "opacity": 0.95},
-    )
+         customdata=np.column_stack([
+             df_plot["Site ID"].astype(str),
+             df_plot.get("Product Group", "").astype(str),
+             df_plot["_terminal"].astype(str),
+             df_plot["_tcn"].astype(str),
+         ]),
+         hovertemplate=(
+             "<b>Site:</b> %{customdata[0]}"
+             "<br><b>Product:</b> %{customdata[1]}"
+             "<br><b>New Terminal:</b> %{customdata[2]}"
+             "<br><b>New TCN:</b> %{customdata[3]}<extra></extra>"
+         ),
+         marker={"size": 11, "opacity": 0.95},
+     )
+       
     return fig
 
 
