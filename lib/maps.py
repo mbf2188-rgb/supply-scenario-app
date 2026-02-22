@@ -84,7 +84,7 @@ def build_map_figure(df_plot: pd.DataFrame):
             "<br><b>New TCN:</b> %{customdata[3]}<extra></extra>"
         ),
             df_plot.get("New TCN", "").astype(str),
-        ]),
+        ),
         hovertemplate="<b>Site:</b> %{customdata[0]}<br><b>Product:</b> %{customdata[1]}<br><b>Terminal:</b> %{customdata[2]}<extra></extra>",
         marker={"size": 11, "opacity": 0.95},
     )
