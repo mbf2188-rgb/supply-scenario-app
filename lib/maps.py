@@ -50,6 +50,8 @@ def build_map_figure(df_plot: pd.DataFrame):
     terminals = sorted(df_plot["_terminal"].unique().tolist())
     color_map = {t: terminal_color(t) for t in terminals}
 
+    # Use scatter_mapbox with tokenless open-street-map for broad compatibility
+    # in Streamlit Community Cloud and local environments.
     fig = px.scatter_mapbox(
         df_plot,
         lat="_lat_plot",
@@ -59,6 +61,7 @@ def build_map_figure(df_plot: pd.DataFrame):
         center={"lat": center_lat, "lon": center_lon},
         zoom=zoom,
         height=680,
+        height=620,
     )
     fig.update_layout(
         mapbox={"style": "open-street-map", "center": {"lat": center_lat, "lon": center_lon}, "zoom": zoom},
@@ -80,6 +83,9 @@ def build_map_figure(df_plot: pd.DataFrame):
             "<br><b>New Terminal:</b> %{customdata[2]}"
             "<br><b>New TCN:</b> %{customdata[3]}<extra></extra>"
         ),
+            df_plot.get("New TCN", "").astype(str),
+        ]),
+        hovertemplate="<b>Site:</b> %{customdata[0]}<br><b>Product:</b> %{customdata[1]}<br><b>Terminal:</b> %{customdata[2]}<extra></extra>",
         marker={"size": 11, "opacity": 0.95},
     )
     return fig

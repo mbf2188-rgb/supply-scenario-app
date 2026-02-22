@@ -20,6 +20,14 @@ def apply_theme() -> None:
     accent_red = "#d71920"
     accent_green = "#0a8f3d"
     accent_orange = "#ff7a00"
+def apply_theme(dark_mode: bool) -> None:
+    bg = "#0c1730" if dark_mode else "#f7f9fc"
+    fg = "#e5e7eb" if dark_mode else "#111827"
+    card_bg = "#111f3d" if dark_mode else "#ffffff"
+    border = "#1f2f55" if dark_mode else "#d1d5db"
+    accent = "#e11d48"  # subtle 7-Eleven red accent
+    green = "#16a34a"  # subtle 7-Eleven green accent
+    tab_bg = "#0f1b36" if dark_mode else "#eef2ff"
 
     st.markdown(
         f"""
@@ -69,6 +77,14 @@ def apply_theme() -> None:
 
         .stButton > button {{ border: 1px solid {accent_green}; }}
         .stButton > button:hover {{ border-color: {accent_orange}; color: {accent_orange}; }}
+        [data-testid="stSidebar"] {{ background: {card_bg}; border-right: 1px solid {border}; }}
+        [data-testid="stMetric"] {{ background: {card_bg}; border: 1px solid {border}; border-radius: 10px; padding: 10px; }}
+        [data-testid="stExpander"] {{ background: {card_bg}; border: 1px solid {border}; border-radius: 10px; }}
+        [data-testid="stDataFrame"] {{ background: {card_bg}; border: 1px solid {border}; border-radius: 10px; }}
+        .stTabs [data-baseweb="tab-list"] button {{ background: {tab_bg}; border-radius: 8px 8px 0 0; }}
+        .stTabs [aria-selected="true"] {{ border-bottom: 3px solid {accent} !important; }}
+        .stButton > button {{ border: 1px solid {border}; }}
+        .stButton > button:hover {{ border-color: {green}; }}
         h1, h2, h3 {{ color: {fg}; }}
         </style>
         """,

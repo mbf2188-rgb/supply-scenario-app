@@ -85,14 +85,6 @@ def _format_explorer(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _format_cost_delta_table(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for col in ["baseline_value", "new_value", "delta_30", "delta_1y"]:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce").map(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
-    return out
-
-
 def main() -> None:
     st.set_page_config(layout="wide", page_title="Supply & Freight Scenario Viewer")
     st.title("Supply & Freight Scenario Viewer")
@@ -103,7 +95,8 @@ def main() -> None:
         st.info("Upload a CSV or XLSX file to begin.")
         st.stop()
 
-    apply_theme()
+    dark_mode = st.sidebar.toggle("Dark mode", value=False)
+    apply_theme(dark_mode)
 
     try:
         raw = load_uploaded_file(uploaded_file.getvalue(), uploaded_file.name)
@@ -171,49 +164,36 @@ def main() -> None:
         new_scenario = st.selectbox("New scenario", scenarios, index=scenarios.index(default_new), key="cmp_new")
         changed_only = st.checkbox("Changed sites only (New Terminal differs)", value=True)
 
-        compare_df_all = df[df["Scenario"].astype(str).isin([baseline, new_scenario])].copy()
         compare_df = filtered[filtered["Scenario"].astype(str).isin([baseline, new_scenario])].copy()
         if changed_only:
-            compare_df_all = changed_sites_only(compare_df_all, baseline, new_scenario)
             compare_df = changed_sites_only(compare_df, baseline, new_scenario)
 
-        deltas_all = delta_totals(compare_df_all, baseline, new_scenario)
         deltas = delta_totals(compare_df, baseline, new_scenario)
-        impacted_all = impacted_sites_compare(df, baseline, new_scenario)
         impacted = impacted_sites_compare(filtered, baseline, new_scenario)
 
-        st.markdown("#### KPI totals (all sites/products)")
         k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Impacted Sites", impacted_all)
-        k2.metric("Δ Total Cost (30-day)", f"${deltas_all['delta_total_30']:,.0f}")
-        k3.metric("Δ Total Cost (1-year)", f"${deltas_all['delta_total_1y']:,.0f}")
-        k4.metric("Δ Freight Cost (30-day)", f"${deltas_all['delta_freight_30']:,.0f}")
-        k5.metric("Δ Supply Cost (30-day)", f"${deltas_all['delta_supply_30']:,.0f}")
-
-        st.markdown("#### KPI totals (current filters)")
-        f1, f2, f3, f4, f5 = st.columns(5)
-        f1.metric("Impacted Sites", impacted)
-        f2.metric("Δ Total Cost (30-day)", f"${deltas['delta_total_30']:,.0f}")
-        f3.metric("Δ Total Cost (1-year)", f"${deltas['delta_total_1y']:,.0f}")
-        f4.metric("Δ Freight Cost (30-day)", f"${deltas['delta_freight_30']:,.0f}")
-        f5.metric("Δ Supply Cost (30-day)", f"${deltas['delta_supply_30']:,.0f}")
+        k1.metric("Impacted Sites", impacted)
+        k2.metric("Δ Total Cost (30-day)", f"${deltas['delta_total_30']:,.0f}")
+        k3.metric("Δ Total Cost (1-year)", f"${deltas['delta_total_1y']:,.0f}")
+        k4.metric("Δ Freight Cost (30-day)", f"${deltas['delta_freight_30']:,.0f}")
+        k5.metric("Δ Supply Cost (30-day)", f"${deltas['delta_supply_30']:,.0f}")
 
         delta_terminal_pg = delta_by_group(compare_df, baseline, new_scenario, ["New Terminal", "Product Group"], "Total Cost (30 days)")
         st.subheader("Delta cost by New Terminal × Product Group")
-        safe_dataframe(_format_cost_delta_table(delta_terminal_pg))
+        safe_dataframe(delta_terminal_pg)
 
         delta_brand = delta_by_group(compare_df, baseline, new_scenario, ["Brand"], "Total Cost (30 days)")
         st.subheader("Delta cost by Brand")
-        safe_dataframe(_format_cost_delta_table(delta_brand))
+        safe_dataframe(delta_brand)
 
         if "Assigned Carrier" in compare_df.columns:
             delta_carrier = delta_by_group(compare_df, baseline, new_scenario, ["Assigned Carrier"], "Total Cost (30 days)")
             st.subheader("Delta cost by Assigned Carrier")
-            safe_dataframe(_format_cost_delta_table(delta_carrier))
+            safe_dataframe(delta_carrier)
 
         delta_tcn = delta_by_group(compare_df, baseline, new_scenario, ["New TCN"], "Total Cost (30 days)")
         st.subheader("Delta cost by New TCN")
-        safe_dataframe(_format_cost_delta_table(delta_tcn))
+        safe_dataframe(delta_tcn)
 
         delta_volume = delta_by_group(compare_df, baseline, new_scenario, ["New Terminal", "Product Group"], volume_col)
         delta_volume = delta_volume.rename(columns={"delta_30": f"delta_{units}"})
@@ -226,18 +206,9 @@ def main() -> None:
 
     with overview_tab:
         scenario_overview = st.selectbox("Scenario", scenarios, index=scenarios.index(default_primary), key="ov_scenario")
-        ov_df_all = df[df["Scenario"].astype(str) == scenario_overview].copy()
         ov_df = filtered[filtered["Scenario"].astype(str) == scenario_overview].copy()
 
-        st.markdown("#### KPI totals (all sites/products)")
-        o1, o2 = st.columns(2)
-        o1.metric("Impacted Sites", impacted_sites_overview(ov_df_all))
-        o2.metric(f"Total Volume ({units})", f"{pd.to_numeric(ov_df_all.get(volume_col, 0), errors='coerce').fillna(0).sum():,.0f}")
-
-        st.markdown("#### KPI totals (current filters)")
-        of1, of2 = st.columns(2)
-        of1.metric("Impacted Sites", impacted_sites_overview(ov_df))
-        of2.metric(f"Total Volume ({units})", f"{pd.to_numeric(ov_df.get(volume_col, 0), errors='coerce').fillna(0).sum():,.0f}")
+        st.metric("Impacted Sites", impacted_sites_overview(ov_df))
 
         vol_terminal = volume_by_terminal_product(ov_df, volume_col)
         st.subheader(f"Volume by Product Group × New Terminal ({units})")
@@ -273,21 +244,8 @@ def main() -> None:
 
     with explorer_tab:
         st.subheader("Data Explorer")
-        scenario_explorer = st.selectbox("Scenario", scenarios, index=scenarios.index(default_primary), key="ex_scenario")
-        explorer_df = filtered[filtered["Scenario"].astype(str) == scenario_explorer].copy()
-        display_df = _format_explorer(explorer_df)
-
-        st.markdown("#### KPI totals (all sites/products)")
-        e1, e2 = st.columns(2)
-        e1.metric("Rows", f"{len(df):,}")
-        e2.metric("Total Cost (30-day)", f"${pd.to_numeric(df.get('Total Cost (30 days)', 0), errors='coerce').fillna(0).sum():,.0f}")
-
-        st.markdown("#### KPI totals (current filters)")
-        ef1, ef2 = st.columns(2)
-        ef1.metric("Rows", f"{len(explorer_df):,}")
-        ef2.metric("Total Cost (30-day)", f"${pd.to_numeric(explorer_df.get('Total Cost (30 days)', 0), errors='coerce').fillna(0).sum():,.0f}")
-
-        if set(EXPLORER_COLUMNS).issubset(explorer_table(explorer_df).columns):
+        display_df = _format_explorer(filtered)
+        if set(EXPLORER_COLUMNS).issubset(explorer_table(filtered).columns):
             paginated_table(display_df, key="explorer")
         else:
             safe_dataframe(display_df)
