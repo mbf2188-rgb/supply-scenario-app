@@ -110,18 +110,18 @@ def main() -> None:
         left, right = st.columns(2)
         with left:
             st.subheader("Top wins vs baseline (30-day delta)")
-            st.dataframe(wins[["Site ID", "Product Group", "delta_30", "delta_1y"]], width="stretch")
+            st.dataframe(wins[["Site ID", "Product Group", "delta_30", "delta_1y"]], use_container_width=True)
         with right:
             st.subheader("Top losses vs baseline (30-day delta)")
-            st.dataframe(losses[["Site ID", "Product Group", "delta_30", "delta_1y"]], width="stretch")
+            st.dataframe(losses[["Site ID", "Product Group", "delta_30", "delta_1y"]], use_container_width=True)
 
         shift = terminal_shift_matrix(selected_df)
         st.subheader("Terminal shift matrix (Home → New)")
-        st.dataframe(shift, width="stretch")
+        st.dataframe(shift, use_container_width=True)
 
         ranked = selected_df.groupby("New Terminal", as_index=False)[volume_col].sum().sort_values(volume_col, ascending=False)
         st.subheader(f"Volume ranked by New Terminal ({units})")
-        st.dataframe(ranked, width="stretch")
+        st.dataframe(ranked, use_container_width=True)
 
     with compare_tab:
         sx = st.selectbox("Scenario X", scenarios, index=scenarios.index(display) if display in scenarios else 0)
@@ -135,11 +135,11 @@ def main() -> None:
         tx, ty = totals(cmp_df[cmp_df["Scenario"].astype(str) == sx]), totals(cmp_df[cmp_df["Scenario"].astype(str) == sy])
         metric_df = pd.DataFrame([{"Scenario": sx, **tx}, {"Scenario": sy, **ty}])
         st.subheader("Scenario totals (30-day and 1-year)")
-        st.dataframe(metric_df, width="stretch")
+        st.dataframe(metric_df, use_container_width=True)
 
         matrix = volume_by_terminal_product(cmp_df, volume_col)
         st.subheader(f"Volume matrix: New Terminal × Product Group ({units})")
-        st.dataframe(matrix, width="stretch")
+        st.dataframe(matrix, use_container_width=True)
 
     with explorer_tab:
         pg_options = product_groups_available(selected_df)
